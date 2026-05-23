@@ -46,6 +46,14 @@ Modes
                        * soft-delete (is_active=false) rows whose
                          source_record_key is missing from the scrape
 
+Facility scope
+--------------
+When --facility is NOT passed, the scraper iterates only the
+facilities in FACILITY_MAP that have `is_client = true` in
+pc1.facilities for the active tenant. Inactive / non-client facilities
+are skipped silently (no NovaRIS round-trip, no DB write). Pass
+--facility=NAME to bypass this filter for one-off testing.
+
 Flags
 -----
     --facility=NAME       Limit to one facility (e.g. 'Inview-Fremont').
@@ -262,6 +270,25 @@ def compute_hash(parsed: dict) -> str:
 _FACILITY_ID_CACHE: dict = {}
 
 
+def fetch_client_facility_labels(supabase, client_id: int) -> set:
+    """
+    Return the set of pc1.facilities.facility_name values for this
+    client that are flagged is_client=true. Used to scope the
+    iterate-all-facilities path to facilities the tenant actually
+    contracts with — non-client facilities are skipped silently
+    (no NovaRIS round-trip, no DB write).
+    """
+    rows = (
+        _table(supabase, "facilities")
+        .select("facility_name")
+        .eq("client_id", client_id)
+        .eq("is_client", True)
+        .execute()
+        .data or []
+    )
+    return {row["facility_name"] for row in rows}
+
+
 def resolve_facility_id(supabase, client_id: int, facility_label: str):
     """
     Look up pc1.facilities.id for (client_id, facility_name). Hard-fail
@@ -461,12 +488,25 @@ def scrape(args):
     else:
         facilities = list(FACILITY_MAP.keys())
 
+    supabase = get_supabase()
+
+    # When iterating all facilities, scope to client-contracted ones
+    # (pc1.facilities.is_client = true). Explicit --facility bypasses
+    # the filter so one-off debug runs against a non-client facility
+    # still work.
+    if not args.facility:
+        client_labels = fetch_client_facility_labels(supabase, client_id)
+        facilities = [f for f in facilities if f in client_labels]
+        if not facilities:
+            print(f"No is_client=true facilities found in pc1.facilities "
+                  f"for client_id={client_id}. Nothing to scrape.")
+            return
+
     session = make_session()
     if not login(session):
         sys.exit(1)
 
     started_at = time.time()
-    supabase = get_supabase()
     grand_total = 0
 
     r = session.get(VIEW_MODALITIES_URL, timeout=30)
