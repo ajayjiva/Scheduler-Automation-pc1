@@ -9,9 +9,15 @@ Two categories of content live here:
 
   1. NovaRIS protocol metadata
      - BASE_URL, USERNAME, PASSWORD, LOGIN_URL
-     - FACILITY_MAP            (display name → NovaRIS facility ID)
      - MODALITY_MAP            (NovaRIS modality ID → modality_type, machine_name)
      - FACILITY_MODALITIES     (which modality IDs apply per facility)
+
+  Note: there is intentionally NO FACILITY_MAP here. Each scraper looks
+  facility IDs up from the live NovaRIS page (e.g. the
+  ViewModalities.aspx facility dropdown) at run time and matches them
+  to `pc1.facilities.facility_name` by exact string. That keeps PC1
+  RIS-agnostic and means onboarding a facility is a single INSERT into
+  `pc1.facilities` — no code change.
 
   2. ASP.NET WebForms helpers
      - login(session)
@@ -64,24 +70,7 @@ PASSWORD  = os.getenv("NOVARISPASSWORD", "")
 LOGIN_URL = f"{BASE_URL}/Login.aspx"
 
 
-# ── NovaRIS facility + modality lookup tables ───────────────────────────────
-
-# FACILITY_MAP:  display facility name  →  NovaRIS facilitiesDD value.
-# Keep the keys identical to the `facility` text used in Supabase
-# (machineschedule.facility, modalitymachine.facility, etc.) so a
-# scraper can iterate the dict and write rows without translation.
-FACILITY_MAP = {
-    "Inview-Lafayette":         "3",
-    "Inview-Fremont":           "2",
-    "Inview-Oakland":           "4",
-    "Inview-Concord":           "110",
-    "Antioch Medical Imaging":  "7",
-    "CA-IMI Facility":          "1",
-    "PET IMAGING OF SJ":        "107",
-    "San Ramon Bay Radiology":  "10",
-    # Skipped: Asian Health (15), ZRJ UltraSound (16), ZSanta Rita Xray (60),
-    # ZTest (155) — not in production data per scheduleexceptions snapshot.
-}
+# ── NovaRIS modality lookup tables ──────────────────────────────────────────
 
 # MODALITY_MAP:  NovaRIS modalitiesDD value  →  (modality_type, machine_name)
 #
