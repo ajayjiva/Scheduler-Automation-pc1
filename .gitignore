@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env*
+venv/
+.venv/
+.idea/
+.vscode/
+*.log
+
+
+# Local artifacts (not committed)
+out.txt
+*.docx
+~$*
