@@ -85,13 +85,14 @@ To onboard a new facility:
 3. Run the scraper in `--initial-load` mode against that facility once
    to seed `pc1.modalities` — see the
    [scraper doc](./novaris_modalities_scraper.md).
-4. Subsequent nightly delta runs pick it up automatically.
+4. From then on, the facility is picked up by any default on-demand
+   run with no extra step.
 
 To offboard:
 
 1. Set `is_client = false`.
 
-The next nightly run will silently skip it; its existing
+The next on-demand run will silently skip it; its existing
 `pc1.modalities` rows are left untouched (frozen — see the warning
 below). No deletes are issued.
 
@@ -139,7 +140,8 @@ fail to match it against `pc1.facilities.facility_name`. The scraper:
    saw (so the new spelling is visible in the log).
 2. Skips that one facility — it does NOT halt the run.
 3. Continues processing the remaining facilities normally.
-4. Exits non-zero at the end so cron monitoring catches it.
+4. Exits non-zero at the end so the operator notices a partial
+   failure even from the exit code alone.
 
 To resolve a rename, update the row in place:
 
@@ -153,7 +155,7 @@ UPDATE pc1.facilities
 Only `facility_name` changes. The surrogate `id`, `client_id`,
 `is_client`, and every FK pointing at this facility (modalities,
 schedules, exceptions, …) remain untouched — they all reference `id`,
-not the name. The next nightly run picks the renamed facility up
+not the name. The next on-demand run picks the renamed facility up
 normally.
 
 ---

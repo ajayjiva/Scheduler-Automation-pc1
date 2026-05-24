@@ -4,9 +4,10 @@ Scrapes the per-facility modality-machine grid from NovaRIS
 (`ViewModalities.aspx`) and syncs each row into Supabase
 `pc1.modalities`.
 
-This is the **nightly maintenance job** that keeps PC1's idea of "what
+This is the **on-demand sync job** that keeps PC1's idea of "what
 imaging machines exist at each facility" aligned with what NovaRIS
-shows.
+shows. It is run manually — there is no schedule. See
+[When to run this](#when-to-run-this) below.
 
 For the data model the scraper writes to, see
 [`pc1.modalities`](./modalities.md) and
@@ -17,7 +18,7 @@ For the data model the scraper writes to, see
 ## Quick reference
 
 ```powershell
-# Normal nightly run — delta sync, every is_client=true facility
+# Normal on-demand run — delta sync, every is_client=true facility
 python novaRIS_modalities_scraper.py
 
 # Same, but don't write anything (preview)
@@ -92,7 +93,7 @@ and NovaRIS is the source of truth for "what ID to POST."
 
 ### Default — delta sync
 
-This is what the nightly cron runs. For each in-scope facility:
+This is the default mode for any on-demand run. For each in-scope facility:
 
 1. GET `ViewModalities.aspx`, select the facility in the dropdown,
    POST the Search form.
@@ -132,8 +133,8 @@ For each in-scope facility:
 
 Use this **once** when onboarding a facility for the first time, or
 after intentional manual cleanup. It burns surrogate `id`s, so don't
-use it on a facility that's already in production. The nightly job
-should never run with this flag.
+use it on a facility that's already in production. Routine on-demand
+runs should never use this flag.
 
 Combine with `--facility=NAME` to scope the wipe to a single facility
 (strongly recommended — `--initial-load` alone wipes every active
@@ -192,7 +193,8 @@ NovaRIS — the scraper:
 - Prints `ERROR: pc1.facilities.facility_name=… was not found …`
   with the full list of dropdown options actually returned.
 - Skips that one facility, processes the rest normally.
-- Exits with status `3` at the end so cron monitoring catches it.
+- Exits with status `3` at the end so the operator notices a partial
+  failure even if they only check the exit code.
 
 The fix is a single `UPDATE pc1.facilities SET facility_name = …`
 to the new spelling. See
@@ -240,20 +242,46 @@ facilities, not the number of writes.
 
 ## Run recipes
 
-### Daily nightly job
+### When to run this
+
+Modalities change rarely — typically months between meaningful edits
+on the NovaRIS side. There is **no automatic schedule**: the scraper
+is run manually whenever a sync is wanted. Typical triggers:
+
+- A new facility was onboarded — run once with `--initial-load
+  --facility=<name>` (see [Onboarding a new facility](#onboarding-a-new-facility)).
+- A NovaRIS admin has indicated that modality data changed — run a
+  default delta to pick up the diff.
+- Routine maintenance check, roughly once a month.
+
+The scraper is idempotent: re-running it without source-side changes
+produces an all-`unchanged` line and zero DB writes, so there's no
+downside to running it more often than strictly needed.
+
+### Routine on-demand run
 
 ```powershell
+cd C:\Ajay\Scheduler-Automation-pc1
 python novaRIS_modalities_scraper.py
 ```
 
-Schedule via Windows Task Scheduler (or `cron` on a Linux host).
-Recommended: 2–3am local time, after the RIS quiet window. Redirect
-both stdout and stderr to a rotating log file so you can grep when
-something looks wrong:
+Optionally capture the output to a log file (handy when you want to
+diff successive runs):
 
 ```powershell
-python novaRIS_modalities_scraper.py *> "C:\Logs\novaris_modalities_$(Get-Date -f yyyyMMdd).log"
+python novaRIS_modalities_scraper.py *> "C:\Logs\novaris_modalities_$(Get-Date -f yyyy-MM-dd).log"
+$LASTEXITCODE   # 0 = clean, 2 = single-facility hard fail, 3 = one or more facilities skipped
 ```
+
+### Future direction
+
+This scraper is a **stopgap** until a direct NovaRIS ↔ PC1 sync API
+exists. That API will replace the HTML-scrape model with a defined
+push/pull contract, at which point this scraper (and `FACILITY_MAP`-
+style runtime dropdown parsing) goes away entirely. Don't invest in
+heavy operational tooling around it (cron jobs, alerting, log
+pipelines) — keep it as a manual command for the few months it's
+expected to remain.
 
 ### Onboarding a new facility
 
@@ -269,7 +297,8 @@ python novaRIS_modalities_scraper.py *> "C:\Logs\novaris_modalities_$(Get-Date -
    python novaRIS_modalities_scraper.py --initial-load --facility="Inview-Concord"
    ```
 
-4. Drop back to the nightly delta cron from then on.
+4. From then on, the facility is picked up by any default on-demand
+   run (no extra step required).
 
 ### Offboarding a facility
 
@@ -279,9 +308,9 @@ UPDATE pc1.facilities
  WHERE client_id = 1 AND facility_name = 'Some-Facility';
 ```
 
-Next nightly run skips it silently. Re-onboarding is just flipping
-`is_client` back; no `--initial-load` needed unless data drift while
-the facility was offline is unacceptable.
+The next on-demand run skips it silently. Re-onboarding is just
+flipping `is_client` back; no `--initial-load` needed unless data
+drift while the facility was offline is unacceptable.
 
 ### Forcing a re-sync of one facility
 
@@ -341,7 +370,7 @@ UPDATE pc1.facilities
 ```
 
 The surrogate `id` and every FK pointing at this facility (modalities,
-schedules, exceptions) stay valid. The next nightly run picks it up.
+schedules, exceptions) stay valid. The next on-demand run picks it up.
 See [`pc1.facilities` § Rename handling](./facilities.md#rename-handling).
 
 ### Parser produces zero rows but the NovaRIS UI shows data

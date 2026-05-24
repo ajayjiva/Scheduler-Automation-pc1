@@ -63,9 +63,9 @@ pc1.facilities.facility_name exactly (case + whitespace sensitive).
 If a pc1.facilities row's facility_name has no matching dropdown
 option, the scraper prints a loud ERROR naming the mismatch and the
 options it actually saw, skips that facility, processes the rest, and
-exits non-zero so a cron monitor catches it. This is how facility
-renames in NovaRIS surface: as a clear actionable error on the next
-nightly run.
+exits non-zero so an operator notices even from the exit code alone.
+This is how facility renames in NovaRIS surface: as a clear actionable
+error on the next on-demand run.
 
 Flags
 -----
@@ -312,8 +312,8 @@ def fetch_client_facility_names(supabase, client_id: int) -> list:
     """
     Return the sorted list of pc1.facilities.facility_name values for
     this client that are flagged is_client=true. These are the
-    facilities the nightly run will attempt to sync — each one is
-    matched against the live NovaRIS dropdown at run time.
+    facilities a default on-demand run will attempt to sync — each
+    one is matched against the live NovaRIS dropdown at run time.
 
     Returns sorted for deterministic per-facility log ordering.
     """

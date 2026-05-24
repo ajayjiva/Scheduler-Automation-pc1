@@ -274,7 +274,7 @@ def make_session() -> requests.Session:
 
     Retries up to 3 times with exponential backoff on 502 / 503 / 504
     and on connection-reset errors — the failure modes we've seen
-    against NovaRIS during the nightly cron window. POST is retried
+    against NovaRIS under intermittent load. POST is retried
     because NovaRIS's login + facility-switch postbacks are
     idempotent at the application layer (re-sending the same payload
     just re-renders the same page).
