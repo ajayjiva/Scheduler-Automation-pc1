@@ -4,9 +4,10 @@ Scrapes the per-facility modality-machine grid from NovaRIS
 (`ViewModalities.aspx`) and syncs each row into Supabase
 `pc1.modalities`.
 
-This is the **nightly maintenance job** that keeps PC1's idea of "what
+This is the **on-demand sync job** that keeps PC1's idea of "what
 imaging machines exist at each facility" aligned with what NovaRIS
-shows.
+shows. It is run manually — there is no schedule. See
+[When to run this](#when-to-run-this) below.
 
 For the data model the scraper writes to, see
 [`pc1.modalities`](./modalities.md) and
@@ -17,7 +18,7 @@ For the data model the scraper writes to, see
 ## Quick reference
 
 ```powershell
-# Normal nightly run — delta sync, every is_client=true facility
+# Normal on-demand run — delta sync, every is_client=true facility
 python novaRIS_modalities_scraper.py
 
 # Same, but don't write anything (preview)
@@ -71,14 +72,20 @@ For every facility the scraper will touch, `pc1.facilities` must
 contain a row with:
 
 - `client_id` = the active tenant
-- `facility_name` = exactly the key used in
-  `novaRIS_common.FACILITY_MAP` (e.g. `'Inview-Fremont'`)
+- `facility_name` = the **exact** display text from the NovaRIS
+  facility dropdown (case + whitespace + punctuation sensitive — e.g.
+  `'Inview-Fremont'`). The scraper looks this name up against the
+  live NovaRIS dropdown at run time; an unmatched name produces a
+  loud ERROR. See
+  [`pc1.facilities` § Naming expectations](./facilities.md#naming-expectations).
 - `is_client = true` (unless you're invoking with `--facility=NAME`,
   which bypasses the flag)
 
 If the row is missing, the scraper hard-fails with a clear
 "seed the facility before running" message — it does NOT auto-create
-facilities.
+facilities. There is no hardcoded facility list anywhere in the
+codebase — PC1 is the only source of truth for "which facilities,"
+and NovaRIS is the source of truth for "what ID to POST."
 
 ---
 
@@ -86,7 +93,7 @@ facilities.
 
 ### Default — delta sync
 
-This is what the nightly cron runs. For each in-scope facility:
+This is the default mode for any on-demand run. For each in-scope facility:
 
 1. GET `ViewModalities.aspx`, select the facility in the dropdown,
    POST the Search form.
@@ -126,8 +133,8 @@ For each in-scope facility:
 
 Use this **once** when onboarding a facility for the first time, or
 after intentional manual cleanup. It burns surrogate `id`s, so don't
-use it on a facility that's already in production. The nightly job
-should never run with this flag.
+use it on a facility that's already in production. Routine on-demand
+runs should never use this flag.
 
 Combine with `--facility=NAME` to scope the wipe to a single facility
 (strongly recommended — `--initial-load` alone wipes every active
@@ -141,7 +148,7 @@ facility's data and re-seeds them all).
 |-----------------------|--------|
 | `--initial-load`      | Switch from delta mode to wipe + bulk insert per facility. |
 | `--dry-run`           | Parse + compute everything; skip every Supabase write. The per-facility log line says `(dry run, not applied)`. |
-| `--facility=NAME`     | Process only this one facility (must match a key in `FACILITY_MAP`). **Bypasses the `is_client` filter** — useful for debug runs against a non-client facility. |
+| `--facility=NAME`     | Process only this one facility. The name must match a `pc1.facilities.facility_name` **and** the live NovaRIS dropdown text exactly. **Bypasses the `is_client` filter** — useful for debug runs against a non-client facility. Halts immediately with exit 2 if the name isn't in the NovaRIS dropdown. |
 | `--client-id=NNNN`    | Override the active tenant for this run. Beats the `CLIENT_ID` env var and the default. |
 | `--quiet`             | Suppress per-facility progress chatter (the `selecting facility … posting Search` lines). The summary line per facility still prints. |
 | `--save-grid=FILE`    | Save the HTML of the first parsed grid to `FILE`. Use this when parsing produces zero rows so the HTML can be inspected and the parser adjusted. |
@@ -150,12 +157,14 @@ facility's data and re-seeds them all).
 
 ## Facility scope (the `is_client` filter)
 
-When `--facility` is **not** passed, the scraper iterates only the
-facilities present in `FACILITY_MAP` **and** flagged
-`is_client = true` in `pc1.facilities` for the active tenant.
-Facilities in `FACILITY_MAP` whose row is `is_client = false` are
-**skipped silently** — no log line, no NovaRIS HTTP call, no DB read
-or write.
+When `--facility` is **not** passed, the scraper iterates every row
+in `pc1.facilities` for the active tenant flagged `is_client = true`.
+For each one, it looks up the NovaRIS facility ID at run time by
+matching `facility_name` against the live "Facility:" dropdown on
+`ViewModalities.aspx` (exact string equality).
+
+`is_client = false` rows are **skipped silently** — no log line, no
+NovaRIS HTTP call, no DB read or write.
 
 This:
 
@@ -174,6 +183,32 @@ catch-up writes.
 If you need to run against an `is_client = false` facility for any
 reason (debugging, one-off audit), pass `--facility=NAME` — it
 bypasses the filter entirely.
+
+### What happens when a facility can't be matched
+
+If `pc1.facilities.facility_name` doesn't appear in the live NovaRIS
+dropdown — almost always because someone renamed the facility in
+NovaRIS — the scraper:
+
+- Prints `ERROR: pc1.facilities.facility_name=… was not found …`
+  with the full list of dropdown options actually returned.
+- Skips that one facility, processes the rest normally.
+- Exits with status `3` at the end so the operator notices a partial
+  failure even if they only check the exit code.
+
+The fix is a single `UPDATE pc1.facilities SET facility_name = …`
+to the new spelling. See
+[`pc1.facilities` § Rename handling](./facilities.md#rename-handling)
+for the SQL and reasoning.
+
+### What happens when NovaRIS has a facility PC1 doesn't know about
+
+It is silently ignored. The scraper iterates `pc1.facilities`, not
+the NovaRIS dropdown — extra facilities in NovaRIS that have no
+corresponding `pc1.facilities` row are never read, never POSTed for,
+and never written about. Onboarding such a facility is the single
+INSERT documented in
+[`pc1.facilities` § Onboarding](./facilities.md#is_client-semantics).
 
 ---
 
@@ -207,34 +242,63 @@ facilities, not the number of writes.
 
 ## Run recipes
 
-### Daily nightly job
+### When to run this
+
+Modalities change rarely — typically months between meaningful edits
+on the NovaRIS side. There is **no automatic schedule**: the scraper
+is run manually whenever a sync is wanted. Typical triggers:
+
+- A new facility was onboarded — run once with `--initial-load
+  --facility=<name>` (see [Onboarding a new facility](#onboarding-a-new-facility)).
+- A NovaRIS admin has indicated that modality data changed — run a
+  default delta to pick up the diff.
+- Routine maintenance check, roughly once a month.
+
+The scraper is idempotent: re-running it without source-side changes
+produces an all-`unchanged` line and zero DB writes, so there's no
+downside to running it more often than strictly needed.
+
+### Routine on-demand run
 
 ```powershell
+cd C:\Ajay\Scheduler-Automation-pc1
 python novaRIS_modalities_scraper.py
 ```
 
-Schedule via Windows Task Scheduler (or `cron` on a Linux host).
-Recommended: 2–3am local time, after the RIS quiet window. Redirect
-both stdout and stderr to a rotating log file so you can grep when
-something looks wrong:
+Optionally capture the output to a log file (handy when you want to
+diff successive runs):
 
 ```powershell
-python novaRIS_modalities_scraper.py *> "C:\Logs\novaris_modalities_$(Get-Date -f yyyyMMdd).log"
+python novaRIS_modalities_scraper.py *> "C:\Logs\novaris_modalities_$(Get-Date -f yyyy-MM-dd).log"
+$LASTEXITCODE   # 0 = clean, 2 = single-facility hard fail, 3 = one or more facilities skipped
 ```
+
+### Future direction
+
+This scraper is a **stopgap** until a direct NovaRIS ↔ PC1 sync API
+exists. That API will replace the HTML-scrape model with a defined
+push/pull contract, at which point this scraper (and `FACILITY_MAP`-
+style runtime dropdown parsing) goes away entirely. Don't invest in
+heavy operational tooling around it (cron jobs, alerting, log
+pipelines) — keep it as a manual command for the few months it's
+expected to remain.
 
 ### Onboarding a new facility
 
-1. INSERT row into `pc1.facilities`
-   (`client_id`, `facility_name`, `is_client = true`).
-2. Confirm `facility_name` matches a key in
-   `novaRIS_common.FACILITY_MAP`. Add the mapping there if it's new.
+1. Open NovaRIS → "Manage Modalities" and copy the new facility's
+   display name from the "Facility:" dropdown **exactly** as it
+   appears (case, hyphens, spaces, punctuation all matter).
+2. INSERT a row into `pc1.facilities` with `client_id` set to the
+   tenant, `facility_name` set to the string from step 1, and
+   `is_client = true`. No code change is required.
 3. Seed once:
 
    ```powershell
    python novaRIS_modalities_scraper.py --initial-load --facility="Inview-Concord"
    ```
 
-4. Drop back to the nightly delta cron from then on.
+4. From then on, the facility is picked up by any default on-demand
+   run (no extra step required).
 
 ### Offboarding a facility
 
@@ -244,9 +308,9 @@ UPDATE pc1.facilities
  WHERE client_id = 1 AND facility_name = 'Some-Facility';
 ```
 
-Next nightly run skips it silently. Re-onboarding is just flipping
-`is_client` back; no `--initial-load` needed unless data drift while
-the facility was offline is unacceptable.
+The next on-demand run skips it silently. Re-onboarding is just
+flipping `is_client` back; no `--initial-load` needed unless data
+drift while the facility was offline is unacceptable.
 
 ### Forcing a re-sync of one facility
 
@@ -282,16 +346,32 @@ environment.
 
 ### "No pc1.facilities row found for client_id=…, facility_name=…"
 
-The facility isn't seeded for this tenant. Either INSERT the row in
-`pc1.facilities` (see [Onboarding](#onboarding-a-new-facility)) or
-drop the `FACILITY_MAP` key that doesn't apply to this tenant.
+The facility isn't seeded for this tenant. INSERT the row in
+`pc1.facilities` — see [Onboarding](#onboarding-a-new-facility).
 
 ### "No is_client=true facilities found in pc1.facilities for client_id=…"
 
-You invoked without `--facility` and every entry in `FACILITY_MAP`
-either has no matching `pc1.facilities` row or has `is_client = false`
-for this tenant. Either flip a facility on, or pass `--facility=NAME`
-explicitly.
+The tenant has no rows in `pc1.facilities` with `is_client = true`.
+Either flip an existing row on, INSERT a new one, or pass
+`--facility=NAME` explicitly to bypass the filter.
+
+### "pc1.facilities.facility_name=… was not found in the live NovaRIS facility dropdown"
+
+The PC1 row exists and is `is_client = true`, but its `facility_name`
+doesn't appear in the live NovaRIS "Facility:" dropdown. Almost
+always a rename in NovaRIS. The error message lists every option the
+dropdown returned — pick the new spelling and run:
+
+```sql
+UPDATE pc1.facilities
+   SET facility_name = '<new spelling>'
+ WHERE client_id = <tenant>
+   AND facility_name = '<old spelling>';
+```
+
+The surrogate `id` and every FK pointing at this facility (modalities,
+schedules, exceptions) stay valid. The next on-demand run picks it up.
+See [`pc1.facilities` § Rename handling](./facilities.md#rename-handling).
 
 ### Parser produces zero rows but the NovaRIS UI shows data
 
@@ -323,11 +403,15 @@ re-run that one on partial failures.)
 
 ## Internals (one-paragraph summary)
 
-`scrape()` resolves the tenant, intersects `FACILITY_MAP` with
-`pc1.facilities` (skipping the intersect when `--facility` is given),
-logs in to NovaRIS, then for each facility GETs the modalities page,
-posts the facility-scoped Search, parses the resulting grid into dict
-records, resolves `facility_id` from `pc1.facilities` (cached
+`scrape()` resolves the tenant, lists `pc1.facilities` rows with
+`is_client = true` (or uses the explicit `--facility` arg), logs in
+to NovaRIS, fetches `ViewModalities.aspx` once, and parses the
+"Facility:" dropdown into a `{display_name: NovaRIS_id}` map. For
+each facility it looks the name up in that runtime map — missing
+names produce a loud ERROR and are skipped (or hard-fail under
+`--facility`). For matched facilities it GETs the modalities page,
+posts the facility-scoped Search, parses the resulting grid into
+dict records, resolves `facility_id` from `pc1.facilities` (cached
 per-process), and hands the records to `write_delta()` or
 `write_initial_load()`. The delta path computes content hashes,
 diffs against `_fetch_all_existing()`, and issues batched upserts +

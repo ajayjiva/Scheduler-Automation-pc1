@@ -48,16 +48,30 @@ Modes
 
 Facility scope
 --------------
-When --facility is NOT passed, the scraper iterates only the
-facilities in FACILITY_MAP that have `is_client = true` in
-pc1.facilities for the active tenant. Inactive / non-client facilities
-are skipped silently (no NovaRIS round-trip, no DB write). Pass
---facility=NAME to bypass this filter for one-off testing.
+When --facility is NOT passed, the scraper iterates every row in
+pc1.facilities for the active tenant that has `is_client = true`.
+Non-client facilities are skipped silently (no NovaRIS round-trip,
+no DB write). Pass --facility=NAME to bypass this filter for one-off
+testing.
+
+There is no hardcoded list of facilities anywhere in this codebase.
+For each iterated facility, the scraper looks up the NovaRIS facility
+ID at run time by parsing the live "Facility:" dropdown on
+ViewModalities.aspx and matching the option text to
+pc1.facilities.facility_name exactly (case + whitespace sensitive).
+
+If a pc1.facilities row's facility_name has no matching dropdown
+option, the scraper prints a loud ERROR naming the mismatch and the
+options it actually saw, skips that facility, processes the rest, and
+exits non-zero so an operator notices even from the exit code alone.
+This is how facility renames in NovaRIS surface: as a clear actionable
+error on the next on-demand run.
 
 Flags
 -----
     --facility=NAME       Limit to one facility (e.g. 'Inview-Fremont').
-                          Default: iterate every facility in FACILITY_MAP.
+                          Default: iterate every is_client=true facility
+                          in pc1.facilities.
     --dry-run             Parse only; do not touch Supabase.
     --client-id=NNNN      Override the active tenant for this run.
     --quiet               Suppress per-facility progress chatter.
@@ -86,7 +100,6 @@ from supabase_client import get_supabase
 from client_context import add_client_id_arg, resolve_client_id
 from novaRIS_common import (
     BASE_URL,
-    FACILITY_MAP,
     extract_all_form_fields,
     extract_form_state_from_html,
     login,
@@ -127,6 +140,31 @@ def _find_dropdown_name(soup: BeautifulSoup, key: str) -> str:
         if key.lower() in attrs.lower():
             return sel.get("name", "")
     return ""
+
+
+def _parse_facility_dropdown(soup: BeautifulSoup, dropdown_name: str) -> dict:
+    """
+    Build {facility_display_name: NovaRIS facilitiesDD value} from the
+    live ViewModalities.aspx page. The scraper uses this map at run
+    time to translate pc1.facilities.facility_name into the value the
+    POST needs — so onboarding a new facility is a single INSERT into
+    pc1.facilities, never a code change.
+
+    Empty option values (the "Please select…" placeholder) are skipped.
+    """
+    select = soup.find("select", {"name": dropdown_name})
+    if select is None:
+        return {}
+    mapping: dict = {}
+    for opt in select.find_all("option"):
+        value = (opt.get("value") or "").strip()
+        if not value:
+            continue
+        label = opt.get_text(strip=True)
+        if not label:
+            continue
+        mapping[label] = value
+    return mapping
 
 
 def _find_search_event_target(soup: BeautifulSoup) -> str:
@@ -270,13 +308,14 @@ def compute_hash(parsed: dict) -> str:
 _FACILITY_ID_CACHE: dict = {}
 
 
-def fetch_client_facility_labels(supabase, client_id: int) -> set:
+def fetch_client_facility_names(supabase, client_id: int) -> list:
     """
-    Return the set of pc1.facilities.facility_name values for this
-    client that are flagged is_client=true. Used to scope the
-    iterate-all-facilities path to facilities the tenant actually
-    contracts with — non-client facilities are skipped silently
-    (no NovaRIS round-trip, no DB write).
+    Return the sorted list of pc1.facilities.facility_name values for
+    this client that are flagged is_client=true. These are the
+    facilities a default on-demand run will attempt to sync — each
+    one is matched against the live NovaRIS dropdown at run time.
+
+    Returns sorted for deterministic per-facility log ordering.
     """
     rows = (
         _table(supabase, "facilities")
@@ -286,7 +325,7 @@ def fetch_client_facility_labels(supabase, client_id: int) -> set:
         .execute()
         .data or []
     )
-    return {row["facility_name"] for row in rows}
+    return sorted({row["facility_name"] for row in rows})
 
 
 def resolve_facility_id(supabase, client_id: int, facility_label: str):
@@ -478,25 +517,14 @@ def scrape(args):
     _QUIET = args.quiet
 
     client_id = resolve_client_id(args)
-
-    if args.facility:
-        if args.facility not in FACILITY_MAP:
-            print(f"ERROR: unknown facility {args.facility!r}. Known: "
-                  f"{', '.join(sorted(FACILITY_MAP))}")
-            sys.exit(2)
-        facilities = [args.facility]
-    else:
-        facilities = list(FACILITY_MAP.keys())
-
     supabase = get_supabase()
 
-    # When iterating all facilities, scope to client-contracted ones
-    # (pc1.facilities.is_client = true). Explicit --facility bypasses
-    # the filter so one-off debug runs against a non-client facility
-    # still work.
-    if not args.facility:
-        client_labels = fetch_client_facility_labels(supabase, client_id)
-        facilities = [f for f in facilities if f in client_labels]
+    if args.facility:
+        facilities = [args.facility]
+        single_facility_mode = True
+    else:
+        single_facility_mode = False
+        facilities = fetch_client_facility_names(supabase, client_id)
         if not facilities:
             print(f"No is_client=true facilities found in pc1.facilities "
                   f"for client_id={client_id}. Nothing to scrape.")
@@ -508,6 +536,7 @@ def scrape(args):
 
     started_at = time.time()
     grand_total = 0
+    missing_facilities: list = []
 
     r = session.get(VIEW_MODALITIES_URL, timeout=30)
     r.raise_for_status()
@@ -530,10 +559,36 @@ def scrape(args):
         print(f"  Saved initial page HTML to {debug_path!r} for inspection.")
         sys.exit(1)
 
+    # Match pc1.facilities.facility_name to the NovaRIS facilitiesDD
+    # value by exact display-text equality against the live dropdown.
+    runtime_facility_map = _parse_facility_dropdown(soup_initial, facility_dd)
+    if not runtime_facility_map:
+        print(f"ERROR: NovaRIS facility dropdown {facility_dd!r} returned "
+              f"no usable options. Cannot map pc1.facilities.facility_name "
+              f"to NovaRIS facility IDs.")
+        sys.exit(1)
+    vprint(f"  facility dropdown options: {len(runtime_facility_map)}")
+
     save_grid_path = args.save_grid
 
     for facility_label in facilities:
-        novaRIS_facility_id = FACILITY_MAP[facility_label]
+        novaRIS_facility_id = runtime_facility_map.get(facility_label)
+        if novaRIS_facility_id is None:
+            available = ", ".join(sorted(runtime_facility_map))
+            print(
+                f"ERROR: pc1.facilities.facility_name={facility_label!r} "
+                f"(client_id={client_id}) was not found in the live "
+                f"NovaRIS facility dropdown. Either the facility was "
+                f"renamed in NovaRIS, or the pc1.facilities row has a "
+                f"typo. Update pc1.facilities.facility_name to match "
+                f"the NovaRIS display text exactly.\n"
+                f"  NovaRIS dropdown currently offers: {available}"
+            )
+            if single_facility_mode:
+                sys.exit(2)
+            missing_facilities.append(facility_label)
+            continue
+
         vprint(f"  [{facility_label}] selecting facility "
                f"(NovaRIS id={novaRIS_facility_id}) and posting Search ...",
                end=" ", flush=True)
@@ -588,6 +643,15 @@ def scrape(args):
     print(f"\nDone. Total records processed: {grand_total}  "
           f"Elapsed: {mm}m {ss}s  Rate: {rate:.1f} records/sec")
 
+    if missing_facilities:
+        print(
+            f"WARNING: {len(missing_facilities)} facility(ies) skipped — "
+            f"no match in NovaRIS dropdown: "
+            f"{', '.join(missing_facilities)}. Update "
+            f"pc1.facilities.facility_name for each, then re-run."
+        )
+        sys.exit(3)
+
 
 DESCRIPTION = (
     "Scrape per-facility modality-machine grids from NovaRIS and "
@@ -607,7 +671,10 @@ def main():
                    help="Parse only; do not write to Supabase.")
     p.add_argument("--facility", default="",
                    help="Limit to one facility (e.g. 'Inview-Fremont'). "
-                        "Default iterates every facility in FACILITY_MAP.")
+                        "Must match a pc1.facilities.facility_name AND "
+                        "the live NovaRIS dropdown text exactly. Default "
+                        "iterates every is_client=true facility in "
+                        "pc1.facilities.")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress per-facility progress chatter.")
     p.add_argument("--save-grid", default="",

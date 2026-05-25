@@ -2,7 +2,7 @@
 
 One row per **physical imaging machine** at a facility, sourced from
 the tenant's RIS (currently NovaRIS). This is the table the
-`novaRIS_modalities_scraper.py` nightly job maintains.
+`novaRIS_modalities_scraper.py` on-demand sync job maintains.
 
 Rows in `pc1.modalities` are **never hard-deleted** under normal
 operation. Removals are represented by `is_active = false` and the
@@ -145,7 +145,7 @@ rows changed content + 1 row came back from the dead.
 
 This **does** burn `id`s — use it only when seeding a new facility for
 the first time, or after intentional manual cleanup. It is not the
-nightly pattern.
+routine on-demand pattern.
 
 ---
 
