@@ -105,6 +105,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 
 from bs4 import BeautifulSoup
 
@@ -177,6 +178,19 @@ def _table(supabase, name: str):
 def _chunked(seq, n):
     for i in range(0, len(seq), n):
         yield seq[i:i + n]
+
+
+def _write_debug_html(path: str, html: str) -> None:
+    """
+    Write HTML to `path`, creating the parent directory if needed.
+    The repo ships with debug/ in .gitignore so dumps land there
+    without polluting the working tree, but the folder isn't tracked
+    — so it might not exist in a fresh clone.
+    """
+    p = Path(path)
+    if p.parent and not p.parent.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(html, encoding="utf-8")
 
 
 # ── Modality dropdown discovery ─────────────────────────────────────────────
@@ -721,8 +735,7 @@ def scrape(args):
             continue
 
         if args.save_grid and not saved_grid:
-            with open(args.save_grid, "w", encoding="utf-8") as fh:
-                fh.write(html)
+            _write_debug_html(args.save_grid, html)
             vprint(f"\n    [debug] grid saved to {args.save_grid!r}", end="")
             saved_grid = True
 
@@ -774,8 +787,7 @@ def scrape(args):
             else:
                 wizards[pid] = html
                 if args.save_wizard and not saved_wizard:
-                    with open(args.save_wizard, "w", encoding="utf-8") as fh:
-                        fh.write(html)
+                    _write_debug_html(args.save_wizard, html)
                     vprint(f"\n    [debug] wizard saved to "
                            f"{args.save_wizard!r}", end="")
                     saved_wizard = True
