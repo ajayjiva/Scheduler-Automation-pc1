@@ -12,3 +12,6 @@ venv/
 out.txt
 *.docx
 ~$*
+
+# Debug dumps and scratch files — write throwaway artifacts here
+debug/
