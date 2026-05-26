@@ -72,6 +72,30 @@ LOGIN_URL = f"{BASE_URL}/Login.aspx"
 
 # ── NovaRIS modality lookup tables ──────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPRECATED — NOT IN USE (kept temporarily for reference).
+#
+# MODALITY_MAP and FACILITY_MODALITIES below are leftovers from the legacy
+# project. Nothing in the current pc1-based codebase imports either dict —
+# verified with `grep -rn "MODALITY_MAP\|FACILITY_MODALITIES" --include="*.py"`
+# returning no hits outside this file.
+#
+# The live equivalents are now in the database, not in Python:
+#   * MODALITY_MAP          →  pc1.modalities — one row per physical machine,
+#                              maintained by novaRIS_modalities_scraper.py.
+#                              See docs/modalities.md.
+#   * FACILITY_MODALITIES   →  derived at query time by joining pc1.facilities
+#                              and pc1.modalities on facility_id, filtered to
+#                              is_active = true. No standalone lookup table
+#                              is needed — the FK relationship already
+#                              encodes "which modalities at which facility."
+#
+# Both dicts will be deleted in the final consolidation pass (docs cleanup +
+# Python refactor). Until then, treat them as historical reference: do NOT
+# import or extend them. Any new code that needs this information should
+# read from the pc1 tables instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # MODALITY_MAP:  NovaRIS modalitiesDD value  →  (modality_type, machine_name)
 #
 # modality_type must match what your orders use (MRI, CT, US, DX, MG, OT, …).
@@ -136,6 +160,10 @@ MODALITY_MAP = {
     "104": ("DX",  "XR-SR"),
 }
 
+# DEPRECATED — NOT IN USE. See the banner comment above MODALITY_MAP for
+# the rationale. Scheduled for removal in the final consolidation pass.
+# Live equivalent: join pc1.facilities and pc1.modalities on facility_id.
+#
 # Which modality IDs are available at each facility.
 # Trimmed to the machines actually carrying scheduling data — UNKNOWN-named
 # entries and inactive duplicates from --discover are intentionally omitted.
