@@ -715,19 +715,32 @@ def scrape(args):
     vprint(f"  modality dropdown: {dd_name!r} with {len(options)} "
            f"option(s) to scrape.")
 
-    form_state = extract_form_state_from_html(r.text)
-    base_fields = extract_all_form_fields(r.text)
-
     saved_grid = saved_wizard = False
     all_grid_rows: list = []
     grid_rows_by_modality: dict = {}   # source_record_key → modality_dd_value
+    pass1_started = time.time()
 
-    # Pass 1: per-modality grid scrape
+    # Pass 1: per-modality grid scrape.
+    #
+    # We do a FRESH GET of the procedures page before each modality
+    # postback rather than carrying form_state / base_fields across
+    # iterations. ASP.NET embeds grid state into __VIEWSTATE, so the
+    # hidden field grows with every postback — by the 37th modality the
+    # POST payload is megabytes and NovaRIS takes minutes to deserialize
+    # it, turning a sub-second round-trip into ~5min/modality.
+    # The fresh GET resets __VIEWSTATE to its small initial value each
+    # time, matching the pattern in novaRIS_modalities_scraper.py.
+    # Cost: one extra HTTP GET (~1s) per modality. Win: pass-1 drops
+    # from ~3h to ~3-5min on a 37-option dropdown.
     for opt in options:
         mod_value = opt["value"]
         vprint(f"  [pass1] modality={mod_value!r} ... ", end="", flush=True)
         try:
-            html, base_fields = post_grid_for_modality(
+            fresh = session.get(VIEW_PROCEDURES_URL, timeout=30)
+            fresh.raise_for_status()
+            form_state = extract_form_state_from_html(fresh.text)
+            base_fields = extract_all_form_fields(fresh.text)
+            html, _ = post_grid_for_modality(
                 session, form_state, base_fields, dd_name, mod_value
             )
         except Exception as exc:
@@ -746,6 +759,10 @@ def scrape(args):
         for row in rows:
             grid_rows_by_modality[row["source_record_key"]] = mod_value
         all_grid_rows.extend(rows)
+
+    pass1_elapsed = time.time() - pass1_started
+    p1m, p1s = divmod(int(pass1_elapsed), 60)
+    vprint(f"  pass-1 elapsed: {p1m}m {p1s}s")
 
     # Dedupe on source_record_key. A procedure SHOULD only appear under
     # one modality, but the API has surprised us before — be defensive.
