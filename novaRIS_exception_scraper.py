@@ -12,14 +12,23 @@ Why two passes
 NovaRIS surfaces an exception rule's data across two pages:
 
     Pass 1 — ModalityScheduling.aspx (the grid).
-             Filtered by Facility + Modality via two dropdowns. The
-             page is rendered via an ASP.NET UpdatePanel AJAX postback
-             — the grid HTML comes back wrapped in pipe-delimited
-             segments rather than a full HTML response. Each <tr>
-             carries setActionSource('<modalityID>', '<frequencyId>',
-             '<rowIdx>') plus 10 visible cells: Name (machine),
-             Modality Type, Facility, Description, Start Date,
-             Start Time, End Date, End Time, Recurrence, Type.
+             Filtered by Facility via the facilitiesDD dropdown. The
+             modality dropdown is left blank so the server returns
+             every machine's rules for the facility in one response.
+             Each <tr> carries setActionSource('<modalityID>',
+             '<frequencyId>', '<rowIdx>') plus 10 visible cells:
+             Name (machine), Modality Type, Facility, Description,
+             Start Date, Start Time, End Date, End Time, Recurrence,
+             Type.
+
+             Transport note: the page uses plain ASP.NET full-page
+             postbacks — NOT MS UpdatePanel AJAX. (An older NovaRIS
+             version did use AJAX UpdatePanel here; the page has
+             since been migrated. The current page has no
+             PageRequestManager._initialize call, no Search button,
+             and no AutoPostBack on the dropdowns. POSTing the form
+             with a new facilitiesDD value triggers server-side
+             re-render.)
 
     Pass 2 — ModalitySchedulingPopup.aspx?frequencyId=<id>
              &isOccurrence=false (the per-rule detail popup).
@@ -31,7 +40,7 @@ NovaRIS surfaces an exception rule's data across two pages:
 Pass 2 is the expensive one (one HTTP round-trip per recurring rule)
 so it runs in a ThreadPoolExecutor with a small worker count. Total
 wall-clock is dominated by the count of recurring rules across all
-(facility, modality) pairs.
+facilities.
 
 Iteration shape
 ---------------
@@ -39,18 +48,15 @@ For each `is_client = true` facility in pc1.facilities for the active
 tenant:
     1. Match facility_name → NovaRIS facilitiesDD value (live dropdown).
     2. Fresh GET ModalityScheduling.aspx (resets __VIEWSTATE).
-    3. POST facility-change → server returns refreshed modality
-       dropdown options for that facility.
-    4. Parse the modality dropdown options (each option is a machine).
-    5. For each option, match the machine name → pc1.modalities.id.
-       Skip with a WARN if the name isn't in pc1.modalities.
-    6. For each matched (modality_dd_value, modality_id):
-        a. POST modality-change → grid HTML for this (facility, modality).
-        b. Pass-2: parallel popup fetches for Weekly/Monthly/Daily rows.
-        c. Build pc1.scheduleexceptions records.
-    7. After all modalities for the facility are scraped, run
-       write_delta or write_initial_load scoped to (client_id,
-       facility_id).
+    3. POST with facilitiesDD set to this facility + ModalityDD blank.
+       The server renders the grid with every machine's rules.
+    4. Parse the grid → list of rows, each tagged with its machine name.
+    5. For each row, look up modality_id from pc1.modalities by
+       machine name. Skip with a WARN if the name isn't in
+       pc1.modalities for this facility.
+    6. Pass 2: parallel popups for Weekly/Monthly/Daily rows.
+    7. Build records → write_delta or write_initial_load scoped
+       to (client_id, facility_id).
 
 Schema mapping (pc1.scheduleexceptions)
 ---------------------------------------
@@ -102,12 +108,13 @@ Flags
 -----
     --dry-run             Parse only; no Supabase writes.
     --facility=NAME       Limit to one facility (e.g. 'Inview-Fremont').
-    --modality=NAME       Limit to one machine name (e.g. 'FRE-MRI').
-                          Case-insensitive substring match against the
-                          NovaRIS modality dropdown labels.
-    --limit=N             At most N rules per (facility, modality).
+    --modality=NAME       Filter parsed rows to machines whose name
+                          contains NAME (case-insensitive). The
+                          per-facility POST is unchanged — this filter
+                          is applied after parsing the grid.
+    --limit=N             At most N rules per facility.
     --workers=N           Parallel popup fetches (default 6).
-    --quiet               Suppress per-modality progress chatter.
+    --quiet               Suppress per-facility progress chatter.
     --client-id=NNNN      Override the active tenant.
     --save-grid=FILE      Save the first grid HTML response (debugging).
     --save-popup=FILE     Save the first popup HTML response (debugging).
@@ -140,12 +147,10 @@ from client_context import add_client_id_arg, resolve_client_id
 from novaRIS_common import (
     BASE_URL,
     USERNAME,
-    _parse_updatepanel_segments,
     extract_all_form_fields,
     extract_form_state_from_html,
     login,
     make_session,
-    update_form_state_from_updatepanel,
 )
 
 MODALITY_SCHEDULING_URL = f"{BASE_URL}/ModalityScheduling.aspx"
@@ -239,46 +244,6 @@ def find_dropdown_name(soup: BeautifulSoup, key: str) -> str:
     return ""
 
 
-def find_script_manager_name(soup: BeautifulSoup) -> str:
-    """Find the ScriptManager hidden field name (e.g. 'ctl00$ScriptMgr')."""
-    init = soup.find(string=re.compile(r"PageRequestManager\._initialize"))
-    if init:
-        m = re.search(r"_initialize\(\s*['\"]([^'\"]+)['\"]", str(init))
-        if m:
-            return m.group(1)
-    for inp in soup.find_all("input", {"type": "hidden"}):
-        name = inp.get("name", "") or ""
-        if "ScriptMgr" in name or "ScriptManager" in name:
-            return name
-    return "ctl00$ScriptMgr"
-
-
-def find_update_panel_id(soup: BeautifulSoup) -> str:
-    """
-    Extract the first UpdatePanel UniqueID from the page's
-    Sys.WebForms.PageRequestManager._initialize(...) call.
-
-    The third argument of _initialize is an array of UpdatePanel IDs
-    prefixed with 't', e.g. 'tctl00$ContentPlaceHolder1$UpdatePanel1'.
-    We strip the 't' to get the actual UniqueID we send in the
-    ScriptManager field.
-    """
-    init = soup.find(string=re.compile(r"PageRequestManager\._initialize"))
-    if not init:
-        return ""
-    m = re.search(r"_initialize\([^[]*?\[(.*?)\]", str(init), re.DOTALL)
-    if not m:
-        return ""
-    array_content = m.group(1)
-    # Skip ErrorPanel and similar non-grid panels.
-    for found in re.findall(r"['\"]t(ctl00\$[^'\"]+)['\"]", array_content):
-        if "Error" in found:
-            continue
-        return found
-    found = re.findall(r"['\"]t(ctl00\$[^'\"]+)['\"]", array_content)
-    return found[0] if found else ""
-
-
 def parse_dropdown_options(html_or_soup, key: str) -> list:
     """
     Return [{'id', 'name'}] for the <select> whose name/id contains `key`.
@@ -303,79 +268,42 @@ def parse_dropdown_options(html_or_soup, key: str) -> list:
     return options
 
 
-def _extract_updatepanel_html(response_text: str) -> str:
+def post_facility_grid(session, form_state, base_fields, facility_dd,
+                       facility_id, modality_dd):
     """
-    Concatenate every UpdatePanel HTML segment from a partial-postback
-    response. These segments hold the rendered grid HTML.
-    """
-    segments = _parse_updatepanel_segments(response_text)
-    parts = [content for seg_type, _seg_id, content in segments
-             if seg_type == "updatePanel"]
-    return "\n".join(parts) if parts else response_text
+    POST ModalityScheduling.aspx with facilitiesDD set to facility_id
+    and ModalityDD blank ("all machines"). Returns the full HTML
+    response.
 
-
-def _post_dropdown_change(session, form_state, base_fields, dd_name, dd_value,
-                          script_manager, update_panel_id,
-                          extra_overrides=None):
-    """
-    Submit a dropdown-change postback as an AJAX UpdatePanel partial
-    postback. Returns (extracted_panel_html, refreshed_base_fields).
-
-    The response is pipe-delimited (length|type|id|content|...). We
-    extract only the updatePanel HTML segments and merge any refreshed
-    form fields back into base_fields, while also refreshing
-    __VIEWSTATE / __EVENTVALIDATION / AntiXsrToken in form_state.
+    Plain ASP.NET full-page postback — the page (since some prior
+    migration away from MS UpdatePanel AJAX) doesn't use partial
+    postbacks any more. We set __EVENTTARGET to the facility dropdown
+    name to give the server a SelectedIndexChanged event to handle;
+    even without browser-side AutoPostBack the server still honors
+    the event.
     """
     payload = dict(base_fields)
     payload.update({
-        "__EVENTTARGET":        dd_name,
+        "__EVENTTARGET":        facility_dd,
         "__EVENTARGUMENT":      "",
         "__LASTFOCUS":          "",
         "__VIEWSTATE":          form_state.get("__VIEWSTATE", ""),
         "__VIEWSTATEGENERATOR": form_state.get("__VIEWSTATEGENERATOR", ""),
         "__EVENTVALIDATION":    form_state.get("__EVENTVALIDATION", ""),
-        "__ASYNCPOST":          "true",
     })
-    payload[dd_name] = dd_value
-    if script_manager:
-        # ScriptManager field encodes which UpdatePanel this postback
-        # targets: "<UpdatePanelUniqueID>|<EventTargetUniqueID>".
-        panel = update_panel_id or ""
-        payload[script_manager] = f"{panel}|{dd_name}"
-    if extra_overrides:
-        payload.update(extra_overrides)
+    payload[facility_dd] = facility_id
+    # Leave ModalityDD blank → server returns rules for every machine
+    # at this facility in one response.
+    if modality_dd:
+        payload[modality_dd] = ""
 
-    r = session.post(
-        MODALITY_SCHEDULING_URL,
-        data=payload,
-        headers={"X-Requested-With": "XMLHttpRequest"},
-        timeout=60,
-    )
+    r = session.post(MODALITY_SCHEDULING_URL, data=payload, timeout=120)
     r.raise_for_status()
-
-    # Pull VIEWSTATE / VIEWSTATEGENERATOR / AntiXsrToken from the
-    # UpdatePanel hiddenField segments.
-    update_form_state_from_updatepanel(r.text, form_state)
-
-    # The shared helper doesn't catch __EVENTVALIDATION; pull it
-    # explicitly so subsequent postbacks don't fail with "Invalid
-    # postback or callback argument".
-    for m in re.finditer(
-        r'\d+\|hiddenField\|(__EVENTVALIDATION)\|([^|]*)\|', r.text
-    ):
-        form_state[m.group(1)] = m.group(2)
-
-    if "|pageRedirect|" in r.text and "DefaultErrorPage" in r.text:
-        raise RuntimeError(
-            "Server returned pageRedirect to DefaultErrorPage. Postback "
-            "rejected (likely __EVENTVALIDATION mismatch)."
-        )
-
-    panel_html = _extract_updatepanel_html(r.text)
-    panel_fields = extract_all_form_fields(panel_html) if panel_html else {}
-    merged = dict(base_fields)
-    merged.update(panel_fields)
-    return panel_html, merged
+    new_state = extract_form_state_from_html(r.text)
+    for k, v in new_state.items():
+        if v:
+            form_state[k] = v
+    return r.text
 
 
 # ── Pass 1: grid parsing ───────────────────────────────────────────────────
@@ -889,17 +817,13 @@ def scrape(args):
     modality_dd = (find_dropdown_name(soup_initial, "modalitiesDD")
                    or find_dropdown_name(soup_initial, "modalityDD")
                    or find_dropdown_name(soup_initial, "modalit"))
-    if not facility_dd or not modality_dd:
-        print(f"ERROR: could not find dropdowns. "
-              f"facility={facility_dd!r}  modality={modality_dd!r}")
+    if not facility_dd:
+        print(f"ERROR: could not find facility dropdown. "
+              f"facility={facility_dd!r}")
         sys.exit(1)
-
-    script_manager = find_script_manager_name(soup_initial)
-    update_panel_id = find_update_panel_id(soup_initial)
     vprint(f"  facility dropdown: {facility_dd!r}")
-    vprint(f"  modality dropdown: {modality_dd!r}")
-    vprint(f"  script manager:    {script_manager!r}")
-    vprint(f"  update panel:      {update_panel_id!r}")
+    vprint(f"  modality dropdown: {modality_dd!r}  (left blank — server "
+           f"returns all machines)")
 
     runtime_facility_map = {f["name"]: f["id"]
                             for f in parse_dropdown_options(
@@ -943,156 +867,135 @@ def scrape(args):
                   f"skipping.")
             continue
 
-        # FRESH GET per facility to reset __VIEWSTATE — same VIEWSTATE-bloat
-        # mitigation that PR #3 added to the procedures scraper. Without it,
-        # accumulated grid state in __VIEWSTATE turns each subsequent POST
-        # payload into megabytes and NovaRIS takes minutes to deserialize.
+        # FRESH GET per facility to reset __VIEWSTATE. NovaRIS embeds the
+        # grid state into __VIEWSTATE; without resetting between facility
+        # POSTs the payload would grow unboundedly across iterations.
         fresh = session.get(MODALITY_SCHEDULING_URL, timeout=30)
         fresh.raise_for_status()
         form_state = extract_form_state_from_html(fresh.text)
         base_fields = extract_all_form_fields(fresh.text)
 
-        vprint(f"  [{facility_label}] selecting facility "
-               f"(NovaRIS id={novaris_facility_id}) ...", end=" ", flush=True)
+        vprint(f"  [pass1] {facility_label} "
+               f"(NovaRIS facility id={novaris_facility_id}) ...",
+               end=" ", flush=True)
         try:
-            panel_html, base_fields = _post_dropdown_change(
+            grid_html = post_facility_grid(
                 session, form_state, base_fields, facility_dd,
-                novaris_facility_id, script_manager, update_panel_id,
+                novaris_facility_id, modality_dd,
             )
         except Exception as exc:
-            print(f"ERROR selecting facility: {exc}")
+            print(f"ERROR fetching grid: {exc}")
             continue
-        vprint("ok.")
 
-        # Modality options now reflect the per-facility list. The legacy
-        # exception scraper found the dropdown options inside the
-        # UpdatePanel partial response, but if the panel doesn't include
-        # the modality select, we fall back to a fresh page parse.
-        modality_options = (parse_dropdown_options(panel_html, "modalitiesDD")
-                            or parse_dropdown_options(panel_html, "modalit"))
-        if not modality_options:
-            # Some NovaRIS versions render the modality dropdown outside
-            # the UpdatePanel; re-GET the page to grab it.
-            r2 = session.get(MODALITY_SCHEDULING_URL, timeout=30)
-            modality_options = (
-                parse_dropdown_options(r2.text, "modalitiesDD")
-                or parse_dropdown_options(r2.text, "modalit"))
-        vprint(f"  [{facility_label}] modality options: {len(modality_options)}")
+        if args.save_grid and not saved_grid:
+            _write_debug_html(args.save_grid, grid_html)
+            vprint(f"\n    [debug] grid saved to {args.save_grid!r}",
+                   end="")
+            saved_grid = True
 
-        # Filter modality options:
-        # - drop names not present in pc1.modalities (skipped silently
-        #   into unknown_machines_overall)
-        # - if --modality is specified, restrict to substring match
-        wanted_modality = args.modality.lower() if args.modality else ""
-        scrape_targets = []
-        unknown_for_this_facility: list = []
-        for opt in modality_options:
-            machine_name = opt["name"]
-            if machine_name not in machine_map:
-                unknown_for_this_facility.append(machine_name)
+        grid_rows = parse_grid(grid_html)
+        # Optional --modality substring filter (post-parse).
+        if args.modality:
+            wanted = args.modality.lower()
+            grid_rows = [g for g in grid_rows
+                         if g.get("name") and wanted in g["name"].lower()]
+        if args.limit:
+            grid_rows = grid_rows[:args.limit]
+        vprint(f"{len(grid_rows)} rows")
+
+        # Resolve modality_id per row by machine name.
+        # Rows whose machine name isn't in pc1.modalities are dropped
+        # with a per-facility debug line and accumulated for the final
+        # NOTE block.
+        unknown_for_this_facility: dict = {}   # machine_name → row count
+        resolved_rows = []
+        for g in grid_rows:
+            machine = g.get("name") or ""
+            mod_id = machine_map.get(machine)
+            if mod_id is None:
+                unknown_for_this_facility[machine] = \
+                    unknown_for_this_facility.get(machine, 0) + 1
                 continue
-            if wanted_modality and wanted_modality not in machine_name.lower():
-                continue
-            scrape_targets.append({
-                "novaris_modality_id": opt["id"],
-                "machine_name":        machine_name,
-                "modality_id":         machine_map[machine_name],
-            })
+            g["_resolved_modality_id"] = mod_id
+            resolved_rows.append(g)
 
         if unknown_for_this_facility:
-            unknown_machines_overall.extend(
-                (facility_label, m) for m in unknown_for_this_facility
-            )
-            vprint(f"  [{facility_label}] [debug] unknown machine names "
-                   f"(not in pc1.modalities): "
-                   f"{', '.join(unknown_for_this_facility)}")
+            for m, n in sorted(unknown_for_this_facility.items()):
+                unknown_machines_overall.append((facility_label, m, n))
+            summary = ", ".join(f"{m!r}×{n}" for m, n
+                                in sorted(unknown_for_this_facility.items()))
+            vprint(f"    [debug] {len(unknown_for_this_facility)} unknown "
+                   f"machine name(s) (not in pc1.modalities): {summary}")
 
-        if not scrape_targets:
-            print(f"  [{facility_label}] no machines to scrape "
-                  f"(after pc1.modalities filter / --modality). Skipping.")
+        if not resolved_rows:
+            print(f"  [{facility_label}] no rows to scrape — skipping write.")
             continue
 
-        # Pass 1 + Pass 2, per (facility, modality)
-        all_records_for_facility = []
-        for tgt in scrape_targets:
-            label = f"{facility_label}/{tgt['machine_name']}"
-            vprint(f"  [pass1] {label} "
-                   f"(NovaRIS modID={tgt['novaris_modality_id']}) ...",
-                   end=" ", flush=True)
-            try:
-                grid_html, base_fields = _post_dropdown_change(
-                    session, form_state, base_fields, modality_dd,
-                    tgt["novaris_modality_id"],
-                    script_manager, update_panel_id,
-                    # Re-send the facility value so the server keeps both
-                    # dropdowns consistent on the modality postback.
-                    extra_overrides={facility_dd: novaris_facility_id},
-                )
-            except Exception as exc:
-                print(f"ERROR fetching grid: {exc}")
-                continue
+        # Pass 2: parallel popup fetches for recurring rules only.
+        popup_rows = [g for g in resolved_rows
+                      if g.get("recurrence") in ("Weekly", "Monthly", "Daily")]
+        popups: dict = {}
+        if popup_rows:
+            workers = max(1, args.workers)
+            vprint(f"  [pass2] {facility_label}: fetching {len(popup_rows)} "
+                   f"popups ({workers} workers) ...")
+            pass2_started = time.time()
+            done_count = [0]
 
-            if args.save_grid and not saved_grid:
-                _write_debug_html(args.save_grid, grid_html)
-                vprint(f"\n    [debug] grid saved to {args.save_grid!r}",
-                       end="")
-                saved_grid = True
+            def _fetch_one(fid):
+                try:
+                    return fid, fetch_popup(session, fid)
+                except Exception as exc:
+                    return fid, f"__ERROR__:{exc}"
 
-            grid_rows = parse_grid(grid_html)
-            # Defensive filter — the grid sometimes echoes rows from a
-            # previous selection during partial postback transitions.
-            grid_rows = [g for g in grid_rows
-                         if g.get("name") == tgt["machine_name"]]
-            if args.limit:
-                grid_rows = grid_rows[:args.limit]
-            vprint(f"{len(grid_rows)} rows")
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for fid, html_text in ex.map(
+                    _fetch_one,
+                    (g["source_record_key"] for g in popup_rows)
+                ):
+                    if isinstance(html_text, str) and html_text.startswith("__ERROR__:"):
+                        print(f"    WARN popup {fid}: {html_text[10:]}")
+                        popups[fid] = ""
+                        failed_popups_box[0] += 1
+                    else:
+                        popups[fid] = html_text
+                        if args.save_popup and not saved_popup:
+                            _write_debug_html(args.save_popup, html_text)
+                            vprint(f"    [debug] popup saved to "
+                                   f"{args.save_popup!r}")
+                            saved_popup = True
 
-            # Pass 2: parallel popup fetches for recurring rules only.
-            popup_rows = [g for g in grid_rows
-                          if g.get("recurrence") in ("Weekly", "Monthly", "Daily")]
-            popups: dict = {}
-            if popup_rows:
-                workers = max(1, args.workers)
+                    done_count[0] += 1
+                    if done_count[0] % 100 == 0 or done_count[0] == len(popup_rows):
+                        elapsed = time.time() - pass2_started
+                        rate = done_count[0] / elapsed if elapsed > 0 else 0
+                        remaining = len(popup_rows) - done_count[0]
+                        eta_s = int(remaining / rate) if rate > 0 else 0
+                        em, es = divmod(eta_s, 60)
+                        pct = (done_count[0] * 100) // len(popup_rows)
+                        vprint(f"    progress: {done_count[0]}/{len(popup_rows)} "
+                               f"({pct}%)  rate: {rate:.1f}/s  "
+                               f"ETA: {em}m {es:02d}s  "
+                               f"failed={failed_popups_box[0]}")
 
-                def _fetch_one(fid):
-                    try:
-                        return fid, fetch_popup(session, fid)
-                    except Exception as exc:
-                        return fid, f"__ERROR__:{exc}"
-
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    for fid, html_text in ex.map(
-                        _fetch_one,
-                        (g["source_record_key"] for g in popup_rows)
-                    ):
-                        if isinstance(html_text, str) and html_text.startswith("__ERROR__:"):
-                            print(f"\n    WARN popup {fid}: {html_text[10:]}")
-                            popups[fid] = ""
-                            failed_popups_box[0] += 1
-                        else:
-                            popups[fid] = html_text
-                            if args.save_popup and not saved_popup:
-                                _write_debug_html(args.save_popup, html_text)
-                                vprint(f"\n    [debug] popup saved to "
-                                       f"{args.save_popup!r}", end="")
-                                saved_popup = True
-
-            now_iso = datetime.now(timezone.utc).isoformat()
-            for g in grid_rows:
-                if g.get("recurrence") in ("Weekly", "Monthly", "Daily"):
-                    detail = parse_popup(
-                        popups.get(g["source_record_key"], ""),
-                        g.get("recurrence") or "")
-                else:
-                    detail = parse_popup("", g.get("recurrence") or "")
-                all_records_for_facility.append(build_db_record(
-                    g, detail, client_id, facility_id, tgt["modality_id"],
-                    novaris_facility_id, now_iso,
-                ))
+        now_iso = datetime.now(timezone.utc).isoformat()
+        records_for_facility = []
+        for g in resolved_rows:
+            if g.get("recurrence") in ("Weekly", "Monthly", "Daily"):
+                detail = parse_popup(
+                    popups.get(g["source_record_key"], ""),
+                    g.get("recurrence") or "")
+            else:
+                detail = parse_popup("", g.get("recurrence") or "")
+            records_for_facility.append(build_db_record(
+                g, detail, client_id, facility_id,
+                g["_resolved_modality_id"],
+                novaris_facility_id, now_iso,
+            ))
 
         # Dedupe by source_record_key within the facility (defensive).
         unique = {}
-        for rec in all_records_for_facility:
+        for rec in records_for_facility:
             unique[rec["source_record_key"]] = rec
         records = list(unique.values())
 
@@ -1115,11 +1018,13 @@ def scrape(args):
           f"Elapsed: {mm}m {ss}s  Rate: {rate:.1f}/s")
 
     if unknown_machines_overall:
+        total_skipped = sum(n for _f, _m, n in unknown_machines_overall)
         print(f"\nNOTE: {len(unknown_machines_overall)} NovaRIS machine "
-              f"name(s) were not found in pc1.modalities — they were "
-              f"skipped without writing exception rows:")
-        for fac, mname in unknown_machines_overall:
-            print(f"  - [{fac}] {mname!r}")
+              f"name(s) were not found in pc1.modalities — {total_skipped} "
+              f"row(s) skipped (no exception rules written for those "
+              f"machines):")
+        for fac, mname, n in unknown_machines_overall:
+            print(f"  - [{fac}] {mname!r}  ({n} row(s))")
 
     failed_popups_total = failed_popups_box[0]
     partial = bool(missing_facilities) or failed_popups_total > 0

@@ -94,26 +94,25 @@ active tenant (or only the one named by `--facility`):
 1. Match `pc1.facilities.facility_name` against the live NovaRIS
    `facilitiesDD` dropdown (loud ERROR + non-zero exit if a facility
    was renamed).
-2. **Fresh GET** of `ModalityScheduling.aspx`, then POST a
-   facility-change UpdatePanel postback. The server returns the
-   refreshed modality dropdown options for this facility.
-3. Resolve each NovaRIS modality dropdown option's machine name
-   against `pc1.modalities.modality_machine` for this facility.
-   Unknown names are skipped (logged in the per-facility debug line
-   and reported in the final summary).
-4. For each resolved `(modality_dd_id, modality_id)`:
-   - **Pass 1** — POST a modality-change UpdatePanel postback,
-     parse the grid (10 cells per row, `setActionSource('<modID>',
-     '<frequencyId>', '<rowIdx>')` for the IDs).
-   - **Pass 2** — for each row whose recurrence is `Weekly`,
-     `Monthly`, or `Daily`, GET
-     `ModalitySchedulingPopup.aspx?frequencyId=<id>&isOccurrence=false`
-     in a `ThreadPoolExecutor` (default 6 workers) to read the
-     day-of-week / day-of-month mask + `repeat_every` interval +
-     any "End On" date override.
-   - `recurrence=None` rules skip pass-2 entirely.
-5. After all modalities for the facility are scraped, dedupe by
-   `source_record_key` and run `write_delta` scoped to
+2. **Fresh GET** of `ModalityScheduling.aspx` (resets the page's
+   `__VIEWSTATE` blob, which NovaRIS otherwise grows on every
+   postback).
+3. **Pass 1** — POST the form with `facilitiesDD` set to this
+   facility and `ModalityDD` left blank. The server renders every
+   machine's rules for the facility in one response. Parse the
+   grid: each `<tr>` carries `setActionSource('<modID>',
+   '<frequencyId>', '<rowIdx>')` plus 10 visible cells.
+4. For each parsed row, look up `modality_id` from
+   `pc1.modalities.modality_machine` for this facility. Rows whose
+   machine name isn't in `pc1.modalities` are dropped with a
+   per-facility debug line and rolled into the final NOTE block.
+5. **Pass 2** — for each row whose recurrence is `Weekly`,
+   `Monthly`, or `Daily`, GET
+   `ModalitySchedulingPopup.aspx?frequencyId=<id>&isOccurrence=false`
+   in a `ThreadPoolExecutor` (default 6 workers) to read the
+   day-of-week / day-of-month mask + `repeat_every` interval +
+   any "End On" date override. `recurrence=None` rules skip pass-2.
+6. Dedupe by `source_record_key` and run `write_delta` scoped to
    `(client_id, facility_id)`:
    - Fetch every scraper-managed row for this facility
      (`source_record_key IS NOT NULL`).
@@ -162,8 +161,8 @@ For each scraped facility:
 | `--initial-load`        | Switch from delta to wipe + bulk insert. Per-facility scope; manually-inserted rows preserved. |
 | `--dry-run`             | Parse + compute everything, including the existing-row fetch (so the breakdown is realistic). Skip every Supabase write. |
 | `--facility=NAME`       | Limit to one facility (e.g. `Inview-Fremont`). Must match `pc1.facilities.facility_name` AND the NovaRIS dropdown text exactly. |
-| `--modality=NAME`       | Limit to one machine. **Case-insensitive substring** match against NovaRIS modality dropdown labels (e.g. `FRE-MRI`, or just `US` to hit every US machine at the facility). |
-| `--limit=N`             | Cap rules per `(facility, modality)`. Combine with `--dry-run` for fast end-to-end testing. |
+| `--modality=NAME`       | Filter parsed rows to machines whose name contains NAME (case-insensitive). The per-facility POST is unchanged — this is a post-parse filter applied in-Python, not a server-side filter. |
+| `--limit=N`             | Cap rules per facility (applied after the optional `--modality` filter). Combine with `--dry-run` for fast end-to-end testing. |
 | `--workers=N`           | Parallel popup fetches in pass 2. Default 6. NovaRIS is single-threaded behind the popup endpoint — pushing past ~8 workers triggers timeouts without speeding up the run. |
 | `--client-id=NNNN`      | Override the active tenant for this run. Beats the `CLIENT_ID` env var. |
 | `--quiet`               | Suppress per-modality progress chatter. Errors, warnings, the per-facility summary, and the final `Done.` line are still shown. |
@@ -179,11 +178,15 @@ to visit both for recurring rules:
 
 ### Pass 1 — Grid (`ModalityScheduling.aspx`)
 
-A grid filtered by Facility + Modality. The page is rendered via
-an ASP.NET **UpdatePanel** AJAX postback — responses come back as
-pipe-delimited segments (`length|type|id|content|...`) rather than
-full HTML. The scraper concatenates the `updatePanel` segments and
-parses them with BeautifulSoup just like a normal HTML page.
+A grid filtered by Facility (via `facilitiesDD`). The Modality
+dropdown is left blank so the server returns every machine's rules
+for the facility in a single response.
+
+**Transport**: plain ASP.NET full-page postback. The page does NOT
+use MS UpdatePanel AJAX (an older NovaRIS version did; the page has
+since been migrated). There is no Search button and no
+`AutoPostBack` on the dropdowns — POSTing the form with a new
+`facilitiesDD` value triggers a server-side re-render.
 
 Each `<tr>` carries:
 
@@ -199,7 +202,8 @@ Each `<tr>` carries:
 | Recurrence      | `recurrence` (`None`/`Daily`/`Weekly`/`Monthly`) |
 | Type            | `type` (`Hard`/`Soft`) |
 
-One HTTP POST per `(facility, modality)` pair.
+One HTTP POST per facility (plus one preceding fresh GET for
+`__VIEWSTATE` reset).
 
 ### Pass 2 — Popup (`ModalitySchedulingPopup.aspx`)
 
@@ -248,14 +252,15 @@ previously-failed rules pay the popup cost on the retry).
 
 ## Log format reference
 
-### Per-facility pass-1 + per-modality pass-1+2
+### Per-facility pass-1 + pass-2
 
 ```
-  [Inview-Fremont] selecting facility (NovaRIS id=2) ... ok.
-  [Inview-Fremont] modality options: 8
-  [pass1] Inview-Fremont/FRE-MRI (NovaRIS modID=1) ... 42 rows
-  [pass1] Inview-Fremont/US1-F (NovaRIS modID=2) ... 17 rows
-  ...
+  [pass1] Inview-Fremont (NovaRIS facility id=2) ... 8072 rows
+    [debug] 2 unknown machine name(s) (not in pc1.modalities): 'UNKNOWN'×3, 'ZTest'×5
+  [pass2] Inview-Fremont: fetching 4218 popups (6 workers) ...
+    progress: 100/4218 (2%)  rate: 8.5/s  ETA: 8m 04s  failed=0
+    progress: 200/4218 (4%)  rate: 8.6/s  ETA: 7m 47s  failed=0
+    ...
 ```
 
 ### Pass-2 popup warnings (only when failures occur)
@@ -288,17 +293,19 @@ previously-failed rules pay the popup cost on the retry).
 ### Final summary + unknown-machine report
 
 ```
-Done. Total records processed: 1,547  Elapsed: 8m 22s  Rate: 3.1/s
+Done. Total records processed: 32,847  Elapsed: 8m 22s  Rate: 65.4/s
 
-NOTE: 2 NovaRIS machine name(s) were not found in pc1.modalities — they were skipped without writing exception rows:
-  - [Inview-Fremont] 'UNKNOWN'
-  - [Inview-Oakland] 'ZTest'
+NOTE: 3 NovaRIS machine name(s) were not found in pc1.modalities — 12 row(s) skipped (no exception rules written for those machines):
+  - [Inview-Fremont] 'UNKNOWN'  (3 row(s))
+  - [Inview-Oakland] 'ZTest'    (5 row(s))
+  - [Inview-Oakland] 'TmpMR'    (4 row(s))
 ```
 
 The `NOTE` block is informational — these are NovaRIS-side machines
 that PC1 doesn't track yet. If the names ought to be tracked, add
 them to `pc1.modalities` (typically via the modalities scraper) and
-re-run.
+re-run. Per-machine row counts make it easy to see whether an
+unknown name represents a meaningful number of rules or just noise.
 
 ---
 
@@ -341,7 +348,8 @@ $LASTEXITCODE   # 0 = clean, 1 = login failed, 2 = facility not found,
 python novaRIS_exception_scraper.py --facility=Inview-Fremont --modality=FRE-MRI --limit=5 --dry-run
 ```
 
-Caps work to one facility × one machine × 5 rules. The delta
+Caps work to one facility, filters parsed rows to machines whose
+name contains `FRE-MRI`, then keeps at most 5 of those. The delta
 breakdown still reflects real DB state so the
 insert/update/unchanged logic can be validated without waiting for a
 full run.
@@ -369,18 +377,37 @@ inserts.
 
 ## Troubleshooting
 
-### "ERROR: could not find dropdowns."
+### "ERROR: could not find facility dropdown."
 
-The grid page's HTML changed and the facility/modality dropdown
-id/name patterns no longer match. Capture the page:
+The grid page's HTML changed and the facility dropdown id/name
+patterns no longer match. Save the page:
 
 ```powershell
-python novaRIS_exception_scraper.py --facility=Inview-Fremont --save-grid=debug/grid.html --dry-run
-type debug/grid.html | findstr /i "<select"
+python -c "from dotenv import load_dotenv; load_dotenv(); from novaRIS_common import login, make_session, BASE_URL; import os; os.makedirs('debug', exist_ok=True); s = make_session(); login(s); open('debug/ms_initial.html','w',encoding='utf-8').write(s.get(f'{BASE_URL}/ModalityScheduling.aspx').text)"
+findstr /i "<select" debug\ms_initial.html
 ```
 
-Update `find_dropdown_name(soup, key)` call-sites at the top of
+Update the `find_dropdown_name(soup, key)` call-sites at the top of
 `scrape()` to match the new id/name pattern.
+
+### Grid response is small / parses zero rows / facility not switching
+
+If the POST returns the same page (default facility's grid)
+regardless of which facility you POSTed for, NovaRIS may have
+changed how it processes the postback. The current implementation
+sets `__EVENTTARGET` to the facility dropdown's name and leaves
+`__ASYNCPOST` unset (full-page postback). If the page now requires
+a different trigger:
+
+```powershell
+python novaRIS_exception_scraper.py --facility=Inview-Fremont --limit=5 --save-grid=debug/grid_fre.html --dry-run
+```
+
+Inspect `debug/grid_fre.html`'s rendered facility — if it doesn't
+match the requested facility, the postback wasn't recognized.
+Workarounds: try a different `__EVENTTARGET` (e.g. an empty string
+or one of the page's buttons), or capture a real browser's request
+via DevTools and mirror its form fields.
 
 ### "ERROR: pc1.facilities.facility_name=X was not found in the live NovaRIS facility dropdown"
 
@@ -445,17 +472,20 @@ locked, or NovaRIS is down. The scraper prints
 `scrape()` resolves the tenant, logs in to NovaRIS, GETs
 `ModalityScheduling.aspx`, parses the facility dropdown, and iterates
 each `pc1.facilities` row with `is_client = true`. For each facility
-it does a fresh GET (VIEWSTATE-bloat fix), POSTs a facility-change
-UpdatePanel postback to load the per-facility modality dropdown,
-then iterates each modality option whose machine name matches a
-`pc1.modalities` row via `fetch_modality_machine_map()`. Unknown
-machine names are accumulated into a final NOTE block.
-`_post_dropdown_change()` handles the UpdatePanel transport
-(`__ASYNCPOST=true`, ScriptManager field, pipe-delimited response
-parsing) using helpers from `novaRIS_common.py`. For each
-`(facility, modality)`, `parse_grid()` extracts rows (pass 1), and a
-`ThreadPoolExecutor` parallel-fetches `ModalitySchedulingPopup.aspx`
-per Weekly/Monthly/Daily row (pass 2). `parse_popup()` extracts the
+it does a fresh GET (resets `__VIEWSTATE`), then `post_facility_grid()`
+issues a plain ASP.NET full-page postback with `facilitiesDD` set to
+the facility's NovaRIS ID and `ModalityDD` left blank — the server
+re-renders the grid with every machine's rules for that facility.
+`parse_grid()` extracts rows from the full HTML response (10 cells
+per `<tr>` plus the IDs in `setActionSource('<modID>',
+'<frequencyId>', '<rowIdx>')`). Each row's machine name is resolved
+to a `modality_id` via `fetch_modality_machine_map()`
+(`pc1.modalities.modality_machine` keyed by `facility_id`,
+`is_active = true`); unknown names are dropped with a per-facility
+debug line and accumulated for the final NOTE block. A
+`ThreadPoolExecutor` then parallel-fetches
+`ModalitySchedulingPopup.aspx` per Weekly/Monthly/Daily row (pass 2)
+with exponential-backoff retry; `parse_popup()` extracts the
 day-mask + repeat-every + end-date-override. `build_db_record()`
 assembles each row with `client_id`, the resolved `facility_id` and
 `modality_id`, content_hash computed over the documented hashed
