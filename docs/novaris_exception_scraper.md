@@ -309,6 +309,72 @@ unknown name represents a meaningful number of rules or just noise.
 
 ---
 
+## Measured performance
+
+Real numbers from the end-to-end verification run on the Inview
+tenant (`client_id = 1`), recorded at scraper-feature ship time so
+future operators have a baseline to compare drift against.
+
+### Per-facility throughput (verification dataset)
+
+| Facility                  | Total rows | One-off rows | Recurring rows (pass-2 popups) | Unknown machines | Initial-load wall-clock |
+|---------------------------|-----------:|-------------:|-------------------------------:|-----------------:|-----------------------:|
+| Antioch Medical Imaging   |      7,990 |        7,873 |                            117 |                0 | ~1m 50s                |
+| Inview-Fremont            |      8,073 |        7,858 |                            215 |                0 | ~2m 05s                |
+| **Total (2 facilities)**  | **16,063** |   **15,731** |                        **332** |            **0** | **4m 17s**             |
+
+### Step-by-step verification run
+
+| Step | Command | Rows | Wall-clock | Notes |
+|------|---------|-----:|-----------:|-------|
+| 1. Smoke test | `--facility=Inview-Fremont --modality=FRE-MRI --limit=5 --dry-run` | 5 | 1m 22s | Cost dominated by HTTP fetches (8 MB initial GET + fresh GET + facility POST); per-row cost is near-zero. |
+| 2. Single-facility initial-load | `--facility=Inview-Fremont --initial-load` | 8,073 | 2m 05s | 215 popup fetches (avg ~4 popups/sec at 6 workers); rate **64.4 rows/sec** overall. |
+| 3. Single-facility delta (re-run of step 2 with no source changes) | `--facility=Inview-Fremont` | 8,073 | 1m 31s | All-`unchanged`. Faster than initial-load because no DB writes. Proves content-hash determinism. |
+| 4. Full-tenant initial-load | `--initial-load` | 16,063 | 4m 17s | Both `is_client=true` facilities; rate **62.4 rows/sec** overall. |
+| 5. Full-tenant delta re-run | (no args) | 16,063 | 2m 43s | All-`unchanged` at scale; rate **97.9 rows/sec** for the read-only path. Confirms idempotency. |
+
+### Where the time goes
+
+For a single facility:
+
+- **8.2 MB page transfer** for the initial GET + fresh GET + facility-change POST is the dominant fixed cost — ~30s per round-trip on a typical residential connection, ~60–90s combined.
+- **Pass 2 popups** scale linearly with the number of recurring rules. At default `--workers=6`, NovaRIS sustains ~3–4 popups/sec (single-threaded behind the dialog endpoint — pushing past 8 workers triggers timeouts without speedup).
+- **Supabase writes** are negligible (batched inserts/updates) — even an 8,073-row initial-load `INSERT` takes a few seconds.
+
+### Scaling expectations
+
+Extrapolating to a hypothetical fully-onboarded tenant with all 8
+NovaRIS facilities active:
+
+| Active facilities | Estimated rows | Estimated wall-clock | Notes |
+|-------------------|---------------:|---------------------:|-------|
+| 2 (current)       |         16,063 |               4m 17s | Measured |
+| 4                 |         ~32,000 |              ~9 min | Linear extrapolation |
+| 8                 |         ~64,000 |             ~18 min | Linear extrapolation |
+
+Linear scaling holds because the per-facility cost is dominated by
+network round-trips that don't share across facilities. The fresh
+GET per facility (the VIEWSTATE-bloat mitigation) costs one extra
+~30s per facility but is non-negotiable.
+
+### When to be concerned about drift
+
+If a future run takes substantially longer than these baselines —
+e.g. a single facility crossing 5 minutes, or all-facility delta
+crossing 30 minutes for a similar row count — likely causes are:
+
+- NovaRIS server load (transient — re-run in an off-hour to confirm).
+- Popup endpoint regressed to lower throughput → tune `--workers`
+  down to 2-4 and watch the per-progress rate.
+- Network path change (residential vs. corporate DNS / proxy
+  differences can change the round-trip cost of the 8 MB page
+  transfer dramatically).
+- `pc1.modalities` not refreshed → unknown-machine NOTE block is
+  large, with many rules silently dropped (look for the per-facility
+  row count diverging from prior runs).
+
+---
+
 ## Run recipes
 
 ### When to run this
