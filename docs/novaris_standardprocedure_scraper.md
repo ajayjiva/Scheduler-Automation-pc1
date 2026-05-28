@@ -284,11 +284,43 @@ few minutes later usually clears transient failures.
 ### Final summary
 
 ```
-Done. Procedures processed: 955  Elapsed: 14m 23s  Rate: 1.1/s
+Done. Procedures processed: 945  Elapsed: 20m 04s  Rate: 0.8/s
 ```
 
 `Procedures processed` is the post-dedupe row count, not the number
 of writes.
+
+---
+
+## Measured performance
+
+Real numbers from on-demand runs against the Inview tenant
+(`client_id = 1`).
+
+| Mode                 | Procedures | Wizard fetches | Wall-clock | Rate    |
+|----------------------|-----------:|---------------:|-----------:|--------:|
+| `--initial-load`     |        945 |            945 |   ~20 min  | ~0.8/s  |
+| Default delta (all-unchanged) | 945 |        945 |   ~20 min  | ~0.8/s  |
+| `--modality=US --dry-run` (subset) | ~190 | ~190 |    ~4 min  | ~0.8/s  |
+
+Pass-2 wizard fetches dominate the wall-clock — one HTTP round-trip
+per procedure, ~6 fetches/sec at default `--workers=6`. Increasing
+workers past ~8 triggers timeouts without speeding the run up.
+
+### Why delta isn't faster than initial-load
+
+Counter-intuitive but correct: a default delta run with no
+source-side changes (`unchanged = 945`) takes about the **same**
+wall-clock as `--initial-load`, because both modes have to fetch
+the same ~945 wizards in pass 2. The content-hash skip happens
+**after** pass 2, in `write_delta()` — it short-circuits DB writes,
+but the NovaRIS round-trips already paid.
+
+A future optimization could skip the wizard fetch for procedures
+whose grid-side fingerprint (modality + required_time + desc) is
+already matched in DB. The current implementation prioritizes
+simplicity and correctness over wall-clock; the procedures catalog
+is small enough that 20 min/run is acceptable.
 
 ---
 
@@ -310,8 +342,8 @@ scraper is run manually whenever a sync is wanted. Typical triggers:
 The scraper is idempotent in delta mode: re-running without
 source-side changes produces an all-`unchanged` line and zero DB
 writes. There's no downside to running it more often than strictly
-needed — except the ~15 minutes of wall-clock cost dominated by
-pass-2 wizard fetches.
+needed — except the ~20 minutes of wall-clock cost dominated by
+pass-2 wizard fetches (see [Measured performance](#measured-performance)).
 
 ### Routine on-demand run
 
@@ -333,7 +365,7 @@ $LASTEXITCODE   # 0 = clean, 1 = login failed, 2 = unknown modality, 3 = one or 
 This scraper is a **stopgap** until a direct NovaRIS ↔ PC1 sync API
 exists. That API will replace the two-pass HTML-scrape model with a
 defined push/pull contract, at which point this scraper (and its
-~15-minute wall-clock) goes away entirely. Don't invest in heavy
+~20-minute wall-clock) goes away entirely. Don't invest in heavy
 operational tooling around it (cron jobs, alerting, log pipelines)
 — keep it as a manual command for the few months it's expected to
 remain.
@@ -358,7 +390,7 @@ python novaRIS_standardprocedure_scraper.py --modality=US --limit=5 --dry-run
 Caps work to one modality × 5 procedures = 5 wizard fetches. The
 delta breakdown still reflects real DB state for those 5 procedures
 so you can validate the insert/update/unchanged logic without
-waiting 15 minutes per attempt.
+waiting 20 minutes per attempt.
 
 ### Cross-tenant invocation
 
