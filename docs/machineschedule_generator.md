@@ -271,13 +271,18 @@ generator is operator-driven today.
 
 Measured on the live Inview Imaging tenant (`client_id = 1`) against
 Supabase, against the May 2026 calendar window (31 days,
-`slot_size = 15`):
+`slot_size = 15`, 10-hour business day):
 
-| Facility | Modalities | Days | Slot size | Slots inserted | Wall time | Rate |
-|---|---|---|---|---|---|---|
-| Inview-Fremont          | 8  | 31 | 15 min | 23,808 | 20 s | 1,145 rows/sec |
-| Antioch Medical Imaging | 10 | 31 | 15 min | 29,760 | ~23 s | ~1,290 rows/sec |
-| **Full tenant** (both, fresh-Antioch + idempotent-Fremont) | 18 | 31 | 15 min | 29,760 new + 23,808 skipped | 40 s | 1,328 rows/sec (aggregate) |
+| Facility | Modalities | Days | Slot size | Slots inserted | `availability=1` / `=0` | Wall time | Rate |
+|---|---|---|---|---|---|---|---|
+| Inview-Fremont          | 8  | 31 | 15 min | 23,808 | ~9,920 / ~13,888 | 20 s | 1,145 rows/sec |
+| Antioch Medical Imaging | 10 | 31 | 15 min | 29,760 | ~12,400 / ~17,360 | ~23 s | ~1,290 rows/sec |
+| **Full tenant** (both)  | 18 | 31 | 15 min | 53,568 total | **22,320 / 31,248** (≈42% in-hours) | 40 s | 1,328 rows/sec (aggregate) |
+
+The 42 % in-hours figure corresponds to a 10-hour business window
+(40 in-hours slot starts out of 96 per day at `slot_size=15`).
+Tenants on the default 9-hour `[08:00, 17:00)` window will see closer
+to 38 % in-hours (36 / 96).
 
 Idempotent re-run on a fully-generated Fremont window: 23,808 rows
 attempted, **0 inserted**, 23,808 silently skipped server-side — 17 s
@@ -297,7 +302,14 @@ above (≈ 2 min wall time end-to-end).
 ### First-time bootstrap for a new facility
 
 1. Confirm `pc1.facilities` has a row for the facility, `is_client = true`,
-   `slot_size` / `timezone` / `advance_booking_days` set as desired.
+   and the per-facility settings (`slot_size`, `timezone`,
+   `advance_booking_days`, `opening_time`, `closing_time`) set as
+   desired. `opening_time` / `closing_time` are particularly worth
+   double-checking before the first run — they drive the
+   `availability=1` vs `availability=0` split for every generated
+   slot, and changing them later requires wiping and regenerating
+   that facility's future window (see
+   [Reacting to a config change](#reacting-to-a-config-change)).
 2. Confirm `pc1.modalities` has the facility's active machines (run
    `novaRIS_modalities_scraper.py --facility=NAME --initial-load`).
 3. Run the generator:
@@ -325,6 +337,7 @@ python generate_machineschedule.py
 | Machine deactivated (`is_active=false` or `status='Inactive'`) | Nothing to do — generator stops emitting; existing slots stay (may still be booked) |
 | `slot_size` changed | Wipe future slots via the SQL above, then re-run the generator |
 | `timezone` changed | Wipe **all** slots for that facility (past + future), then re-run — past UTC values were computed with the wrong timezone |
+| `opening_time` / `closing_time` changed | Wipe future slots via the SQL above, then re-run the generator. The generator does NOT update `availability` on existing rows — the new business-hours rule only applies to freshly-inserted slots. (The Phase 3 reconciler will re-check business hours on every UPDATE it performs, but it never visits an unchanged slot, so a rule change without a wipe leaves the old `availability` in place until something else touches the row.) |
 | `advance_booking_days` changed | Run the generator — the new value drives the next horizon-extension |
 
 ---
