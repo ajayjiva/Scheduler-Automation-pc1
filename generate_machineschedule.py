@@ -29,7 +29,10 @@ in 24-hour day):
     end_time           <- start_time + slot_size (wraps to 00:00 at the
                           end of the day when slot_size divides 24h cleanly)
     capacity       <- 1
-    availability   <- 1 (free; reconciler may flip to 0 later)
+    availability   <- 1 if opening_time <= start_time < closing_time
+                      (in business hours), else 0 (out-of-hours, never
+                      offered to patients). Reconciler may flip
+                      in-hours slots to 0 for Hard exceptions later.
     scheduled      <- NULL (reserved)
     exceptions     <- {} (reconciler-maintained)
     exception_ids  <- {} (reconciler-maintained)
@@ -52,17 +55,18 @@ for the active tenant that has `is_client = true`. Pass
 
 Window resolution
 -----------------
-    start date:    --start-date (default = today facility-local)
-    end date:      start + --days-ahead (default = facility's
-                    advance_booking_days)
-    slot duration: pc1.facilities.slot_size
-    timezone:      pc1.facilities.timezone (IANA name)
+    start date:     --start-date (default = today facility-local)
+    end date:       start + --days-ahead (default = facility's
+                     advance_booking_days)
+    slot duration:  pc1.facilities.slot_size
+    business hours: pc1.facilities.opening_time / closing_time
+    timezone:       pc1.facilities.timezone (IANA name)
 
 pc1.facilities currently carries NOT NULL versions of slot_size,
-advance_booking_days, and timezone, so the resolution degenerates to
-"use the facility value." pc1.clients holds the tenant-level defaults
-and would act as a fallback if any of those columns ever became
-nullable on the facility row.
+advance_booking_days, opening_time, closing_time, and timezone, so
+the resolution degenerates to "use the facility value." pc1.clients
+holds the tenant-level defaults and would act as a fallback if any
+of those columns ever became nullable on the facility row.
 
 Idempotency
 -----------
@@ -160,6 +164,20 @@ def _chunked(seq, n):
 
 # ── Settings resolution (facility overrides client) ─────────────────────────
 
+def _coerce_time(value) -> time:
+    """
+    PostgREST returns Postgres `time` columns as 'HH:MM:SS' strings.
+    Accept either a string or an already-coerced `time` instance and
+    return a `time`. Raises TypeError / ValueError on anything else
+    so the caller can flag the facility as skippable.
+    """
+    if isinstance(value, time):
+        return value
+    if isinstance(value, str):
+        return time.fromisoformat(value)
+    raise TypeError(f"Cannot coerce {value!r} to time")
+
+
 def _resolve_setting(facility_row: dict, client_row: dict, key: str):
     """
     Facility value wins when non-NULL; otherwise fall back to client.
@@ -202,7 +220,7 @@ def _fetch_facility_rows(supabase, client_id: int,
     q = (
         _table(supabase, "facilities")
         .select("id, facility_name, slot_size, advance_booking_days, "
-                "timezone, is_client")
+                "opening_time, closing_time, timezone, is_client")
         .eq("client_id", client_id)
     )
     if facility_name:
@@ -261,13 +279,22 @@ def _iter_slot_times(slot_size: int):
 def _build_records_for_modality(
     client_id: int, facility_id: int, modality_id: int,
     start_date: date, end_date: date, slot_size: int,
-    tz: ZoneInfo, now_iso: str,
+    tz: ZoneInfo, opening_time: time, closing_time: time,
+    now_iso: str,
 ) -> list:
     """
     Generate one record per slot for one modality over the inclusive
     date range. Facility-local wall clock is converted to UTC at write
     time via zoneinfo (DST handled automatically; see module
     docstring).
+
+    Slots whose facility-local start_time falls in the half-open
+    interval [opening_time, closing_time) are initialized with
+    availability=1 (free). All other slots get availability=0 so the
+    scheduling engine never offers an out-of-business-hours slot to
+    a patient. The Phase 3 reconciler must preserve this distinction
+    when expanding exceptions -- see docs/machineschedule_generator.md
+    -> "Initial availability and business hours" for the full rule.
     """
     records = []
     slot_times = list(_iter_slot_times(slot_size))
@@ -285,6 +312,10 @@ def _build_records_for_modality(
             # mis-group every evening slot whose UTC date is the next
             # local day.
             seq_local = int(local_dt.strftime("%Y%m%d%H%M%S"))
+            # Half-open business-hours window: [opening, closing).
+            # Matches the legacy engine's `start_time >= opening
+            # AND start_time < closing` DB filter.
+            in_hours = opening_time <= start_t < closing_time
             records.append({
                 "client_id":         client_id,
                 "facility_id":       facility_id,
@@ -295,7 +326,7 @@ def _build_records_for_modality(
                 "start_time":        start_t.isoformat(),
                 "end_time":          end_t.isoformat(),
                 "capacity":          1,
-                "availability":      1,
+                "availability":      1 if in_hours else 0,
                 "exceptions":        [],
                 "exception_ids":     [],
                 "created_at":        now_iso,
@@ -393,6 +424,29 @@ def generate(args):
             skipped_facilities.append(facility_name)
             continue
 
+        # Business hours drive the initial availability of each slot.
+        # Postgres time columns come back as 'HH:MM:SS' strings via
+        # PostgREST; normalize to time objects so the in-hours check
+        # against start_t inside _build_records_for_modality is a
+        # plain time-vs-time comparison.
+        try:
+            opening_time = _coerce_time(_resolve_setting(
+                fac, client_row, "opening_time"
+            ))
+            closing_time = _coerce_time(_resolve_setting(
+                fac, client_row, "closing_time"
+            ))
+        except (TypeError, ValueError) as exc:
+            print(f"  [{facility_name}] ERROR: opening_time / closing_time "
+                  f"could not be parsed ({exc}). Skipping facility.")
+            skipped_facilities.append(facility_name)
+            continue
+        if opening_time >= closing_time:
+            print(f"  [{facility_name}] ERROR: opening_time={opening_time} "
+                  f">= closing_time={closing_time}. Skipping facility.")
+            skipped_facilities.append(facility_name)
+            continue
+
         # --days-ahead overrides advance_booking_days. Default = the
         # facility's resolved value (override over client default).
         if args.days_ahead is not None:
@@ -434,23 +488,37 @@ def generate(args):
         days_in_window = (end_local - start_local).days + 1
         expected_rows  = len(modalities) * days_in_window * slots_per_day
 
+        # Pre-compute expected in-hours slots per day so the per-facility
+        # log line shows the split between bookable and out-of-hours slots
+        # before any DB write. Same arithmetic the row builder uses.
+        in_hours_per_day = sum(
+            1 for _, st, _ in _iter_slot_times(slot_size)
+            if opening_time <= st < closing_time
+        )
+        expected_in_hours = len(modalities) * days_in_window * in_hours_per_day
+
         vprint(f"  [{facility_name}] slot_size={slot_size}min  "
-               f"tz={tz_name}  window={start_local} -> {end_local} "
+               f"tz={tz_name}  hours=[{opening_time}, {closing_time})  "
+               f"window={start_local} -> {end_local} "
                f"({days_in_window} days)  modalities={len(modalities)}  "
-               f"-> {expected_rows:,} candidate slots")
+               f"-> {expected_rows:,} candidate slots "
+               f"({expected_in_hours:,} availability=1 / "
+               f"{expected_rows - expected_in_hours:,} availability=0)")
 
         now_iso = datetime.now(timezone.utc).isoformat()
         records: list = []
         for m in modalities:
             records.extend(_build_records_for_modality(
-                client_id   = client_id,
-                facility_id = facility_id,
-                modality_id = m["id"],
-                start_date  = start_local,
-                end_date    = end_local,
-                slot_size   = slot_size,
-                tz          = tz,
-                now_iso     = now_iso,
+                client_id    = client_id,
+                facility_id  = facility_id,
+                modality_id  = m["id"],
+                start_date   = start_local,
+                end_date     = end_local,
+                slot_size    = slot_size,
+                tz           = tz,
+                opening_time = opening_time,
+                closing_time = closing_time,
+                now_iso      = now_iso,
             ))
 
         if args.limit is not None and args.limit > 0:

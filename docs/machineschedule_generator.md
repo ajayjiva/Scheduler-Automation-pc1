@@ -33,7 +33,7 @@ start in a 24-hour day)`, one row is INSERTed with:
 | `start_time`    | facility-local time of slot start (`08:00:00`, `08:15:00`, ...) |
 | `end_time`      | `start_time + slot_size`; wraps to `00:00:00` for the last slot |
 | `capacity`      | `1` |
-| `availability`  | `1` (free) — reconciler may flip to `0` later |
+| `availability`  | `1` if `opening_time <= start_time < closing_time` (in business hours), else `0`. See [Initial availability and business hours](#initial-availability-and-business-hours). |
 | `exceptions`    | `'{}'` |
 | `exception_ids` | `'{}'` |
 | `created_at`    | now (UTC) |
@@ -51,6 +51,8 @@ booking), `created_by` / `updated_by` (automated write).
 |----------------------|---------------------------------------------|
 | `slot_size`          | `pc1.facilities.slot_size` → `pc1.clients.slot_size` |
 | `advance_booking_days` (used as default `--days-ahead`) | `pc1.facilities.advance_booking_days` → `pc1.clients.advance_booking_days` |
+| `opening_time`       | `pc1.facilities.opening_time` → `pc1.clients.opening_time` |
+| `closing_time`       | `pc1.facilities.closing_time` → `pc1.clients.closing_time` |
 | `timezone`           | `pc1.facilities.timezone` → `pc1.clients.timezone` |
 
 Today every relevant column is `NOT NULL` on both tables (with
@@ -59,11 +61,67 @@ fallback to client is effectively dead code. It exists for forward
 compatibility per the design rule documented in
 [`docs/machineschedule.md`](./machineschedule.md#slot-window-parameter-resolution).
 
-`opening_time` and `closing_time` are **not used by the generator** —
-slots are emitted for the entire 24-hour day. The columns are
-preserved on both `pc1.clients` and `pc1.facilities` for future
-engine-side enforcement (e.g. "don't surface slots outside business
-hours to patients").
+`opening_time` and `closing_time` drive the **initial `availability`
+value** of each slot — see the next section. The generator still
+emits a full 24-hour grid; the business-hours rule decides whether
+each slot starts life as bookable (`availability=1`) or blocked
+(`availability=0`).
+
+---
+
+## Initial availability and business hours
+
+The generator emits slots for the full 24-hour day so the calendar
+grid is always complete (no "we need to extend hours so let me
+regenerate" pain). Each slot's initial `availability` reflects the
+facility's business hours:
+
+```
+availability = 1 if  opening_time <= start_time < closing_time
+               else 0
+```
+
+The interval is **half-open** (end-exclusive) — same as the legacy
+engine's DB-level filter (`start_time >= opening AND start_time <
+closing`). Worked examples for `opening_time=08:00`,
+`closing_time=17:00`, `slot_size=15`:
+
+| `start_time` | `end_time` | `availability` | Why |
+|---|---|---|---|
+| `07:45` | `08:00` | `0` | Starts before opening |
+| `08:00` | `08:15` | `1` | First in-hours slot |
+| `16:45` | `17:00` | `1` | Last in-hours slot — ends at closing, which is fine |
+| `17:00` | `17:15` | `0` | Starts at closing → out-of-hours |
+| `23:45` | `00:00` | `0` | Overnight |
+
+The Phase 4 scheduling engine filters its slot pool by
+`availability = 1`, so out-of-hours slots are never offered to
+patients. The grid is still present in the DB for future use
+(after-hours scheduling, manual adjustments, reconciler bookkeeping).
+
+### Reconciler note (Phase 3)
+
+The Phase 3 reconciler will further reduce `availability` to 0 for
+slots covered by Hard `pc1.scheduleexceptions` rules. It MUST NOT
+flip out-of-hours slots back to `availability=1` when no Hard
+exception covers them — the "blocked by business hours" state is
+intrinsic to the slot, not exception-derived. The reconciler will
+re-check the in-hours-ness from the slot's `start_time` and the
+facility's `opening_time` / `closing_time` before any flip.
+
+### Per-facility log line
+
+The per-facility output line shows the split:
+
+```
+[Inview-Fremont] slot_size=15min  tz=America/Los_Angeles  hours=[08:00:00, 17:00:00)
+  window=2026-05-29 -> 2026-08-27 (91 days)  modalities=8
+  -> 69,888 candidate slots (26,208 availability=1 / 43,680 availability=0)
+```
+
+For a facility with `slot_size=15` and an 8-hour business day
+(08:00–17:00 = 9 hours wall-clock), 36 of 96 daily slots are
+in-hours → roughly 38% `availability=1`, 62% `availability=0`.
 
 ---
 

@@ -63,7 +63,7 @@ on re-runs.
 | Column         | Type      | Null? | Default | Notes |
 |----------------|-----------|-------|---------|-------|
 | `capacity`     | `integer` | YES   | —       | Generator writes `1`. Reserved for future multi-patient slot support; nothing currently consumes a non-1 value. |
-| `availability` | `integer` | YES   | —       | `0` = blocked, `1` = free. Generator writes `1`; the reconciler drops it to `0` for slots covered by a Hard exception. |
+| `availability` | `integer` | YES   | —       | `0` = blocked, `1` = free. Generator writes `1` for slots whose `start_time` falls in the facility's half-open `[opening_time, closing_time)` business-hours window, `0` otherwise (out-of-hours slots are never offered to patients). The reconciler may further drop in-hours slots to `0` when a Hard exception covers them. See [`docs/machineschedule_generator.md` → Initial availability and business hours](./machineschedule_generator.md#initial-availability-and-business-hours). |
 | `scheduled`    | `integer` | YES   | —       | Reserved for future booking-state bookkeeping (e.g. partial counts when `capacity > 1`). Not currently written. |
 
 ### Exception overlays
@@ -231,8 +231,14 @@ the sole maintainer of both arrays. Its contract:
 3. `exceptions` element format is `'<description> (<marker>)'` where
    `<marker>` is `H` for Hard or `S` for Soft. Empty description is
    allowed: `' (H)'`.
-4. `availability` is `0` when any element has marker `H`, else `1`.
-   The reconciler enforces this invariant on every write.
+4. `availability` is `0` when **any** of the following is true:
+   (a) any `exceptions` element has marker `H` (Hard), OR
+   (b) the slot's `start_time` falls outside the facility's
+       `[opening_time, closing_time)` business-hours window.
+   Otherwise `availability = 1`. The reconciler must preserve the
+   business-hours portion of this invariant — see the generator doc
+   ([Initial availability and business hours](./machineschedule_generator.md#initial-availability-and-business-hours))
+   for the rule.
 
 Postgres can't enforce paired-length or any of the above without a
 trigger. We accept the discipline-enforced contract because the single
@@ -358,6 +364,31 @@ SELECT id, availability, exceptions
        SELECT 1 FROM unnest(exceptions) AS e
         WHERE e LIKE '% (H)'
    );
+
+-- Spot-check the availability-vs-business-hours invariant (should
+-- return zero rows). Any in-hours slot must have availability=1
+-- unless a Hard exception covers it; any out-of-hours slot must have
+-- availability=0 regardless of exceptions.
+SELECT ms.id, ms.start_time, ms.availability,
+       f.opening_time, f.closing_time
+  FROM pc1.machineschedule ms
+  JOIN pc1.facilities      f ON f.id = ms.facility_id
+ WHERE (
+        -- In business hours but availability=0 AND no Hard exception
+        ms.start_time >= f.opening_time
+        AND ms.start_time <  f.closing_time
+        AND ms.availability = 0
+        AND NOT EXISTS (
+            SELECT 1 FROM unnest(ms.exceptions) AS e
+             WHERE e LIKE '% (H)'
+        )
+       )
+    OR (
+        -- Out of business hours but availability=1
+        (ms.start_time <  f.opening_time
+         OR ms.start_time >= f.closing_time)
+        AND ms.availability = 1
+       );
 ```
 
 ---
