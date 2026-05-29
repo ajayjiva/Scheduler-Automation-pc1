@@ -94,6 +94,7 @@ been standardized and tightened during the rewrite (see §4).
 | [`docs/modalities.md`](./modalities.md) | `pc1.modalities` schema — one row per physical machine. Business key, content_hash composition, lifecycle |
 | [`docs/proceduresestimate.md`](./proceduresestimate.md) | `pc1.proceduresestimate` schema — procedure catalog. Four-shape per-machine override design. Cross-tenant trigger semantics |
 | [`docs/scheduleexceptions.md`](./scheduleexceptions.md) | `pc1.scheduleexceptions` schema — scheduling-exception rules (LUNCH, holidays, downtime). Flat recurrence-mask columns, CHECK-constrained `recurrence`/`type`, no override pattern |
+| [`docs/machineschedule.md`](./machineschedule.md) | `pc1.machineschedule` schema — slot calendar. Generator-produced (not RIS-sourced), so no `is_active`/`content_hash`/`ris_*`. UTC `date_and_time` with facility-local convenience columns. Paired `exceptions`/`exception_ids` arrays. `order_id` FK deferred to Phase 4 |
 | [`docs/novaris_modalities_scraper.md`](./novaris_modalities_scraper.md) | The first NovaRIS scraper — reference for per-facility iteration, login flow, runtime facility-id resolution |
 | [`docs/novaris_standardprocedure_scraper.md`](./novaris_standardprocedure_scraper.md) | The second NovaRIS scraper — reference for per-modality iteration, two-pass (grid → wizard) scrape, ThreadPoolExecutor for parallel detail fetches |
 | [`docs/novaris_exception_scraper.md`](./novaris_exception_scraper.md) | The third NovaRIS scraper — reference for per-facility iteration with plain full-page postbacks, name-based modality_id lookup, post-parse `--modality` filtering |
@@ -177,7 +178,13 @@ documented vocabulary so scraper bugs fail at INSERT time. Pattern:
   - `0003_create_pc1_scheduleexceptions.sql` — full table create +
     CHECK constraints + simple `(client_id, facility_id,
     source_record_key)` unique partial + cross-tenant trigger
-  - **Next available number: 0004**
+  - `0004_create_pc1_machineschedule.sql` — full table create +
+    `(client_id, facility_id, modality_id, date_and_time)` UNIQUE
+    business key + GIN on `exception_ids` + cross-tenant trigger.
+    No `is_active` / `content_hash` / `source_record_key` / `ris_*`
+    (slots are generator-produced, not RIS-sourced). `order_id`
+    column present but FK to `pc1.orders` deferred until Phase 4.
+  - **Next available number: 0005**
 
 ### 4.4 Scraper conventions
 
@@ -356,8 +363,8 @@ The forward roadmap, in execution order:
 
 | # | Item | Status | Notes |
 |---|---|---|---|
-| 1 | Port **`pc1.machineschedule`** — the slot calendar | **NEXT TASK** — see §8 | Generates blank availability slots per `(modality, date_and_time)` for a rolling window. Legacy: `create_blank_calendar.py` |
-| 2 | Port **`reconcile_exceptions.py`** | Deferred — depends on (1) | Reads active `pc1.scheduleexceptions`, expands recurrence rules to slot-level, surgically updates `pc1.machineschedule.availability` + `exceptions[]` + `exception_ids[]`. Existing legacy script in repo is a strong starting point — it just needs pc1-schema adaptation |
+| 1 | Port **`pc1.machineschedule`** — the slot calendar | **Phase 1 IN PROGRESS** — schema migration `0004` + `docs/machineschedule.md` shipped. Phase 2 (blank-calendar generator) and Phase 3 (reconciler) still pending — see §8 | Generates blank availability slots per `(modality, date_and_time)` for a rolling window. Legacy: `create_blank_calendar.py` |
+| 2 | Port **`reconcile_exceptions.py`** | Deferred — depends on (1) Phase 2 landing first | Reads active `pc1.scheduleexceptions`, expands recurrence rules to slot-level, surgically updates `pc1.machineschedule.availability` + `exceptions[]` + `exception_ids[]`. Existing legacy script in repo is a strong starting point — it just needs pc1-schema adaptation |
 | 3 | Scrape **patient orders** into `pc1.orders` | Deferred — needed to drive the scheduling engine | Source page in NovaRIS TBD (likely `Orders.aspx` or similar). May or may not need a two-pass scrape. New table; two-phase PR pattern applies |
 | 4 | Port scheduling engine (patient-options builder) | Deferred — depends on (1), (2), (3) | Core business logic; legacy `main.py`. Compute appointment options for patients with multiple orders across multiple modalities |
 | — | Delete `MODALITY_MAP` + `FACILITY_MODALITIES` from `novaRIS_common.py` | Deferred — marked DEPRECATED in PR #3 | Final consolidation pass |

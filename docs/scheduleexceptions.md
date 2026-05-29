@@ -368,5 +368,10 @@ SELECT tgname, pg_get_triggerdef(oid)
 - [`pc1.modalities`](./modalities.md) — supplies `modality_id`.
 - [`pc1.proceduresestimate`](./proceduresestimate.md) — sibling
   catalog table; same audit / source-tracking column conventions.
+- [`pc1.machineschedule`](./machineschedule.md) — the slot calendar
+  table whose `exception_ids` arrays carry this table's
+  `source_record_key` values. The exception reconciler (Phase 3,
+  deferred) is the bridge: it expands active rules here into
+  per-slot overlays there.
 - NovaRIS exception scraper doc — coming with Phase 2 of this
   feature branch.
