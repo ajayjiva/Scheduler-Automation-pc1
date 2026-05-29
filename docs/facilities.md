@@ -236,5 +236,10 @@ UPDATE pc1.facilities
 
 - [`pc1.modalities` doc](./modalities.md) — the table whose lifecycle
   is gated by `is_client`.
+- [`pc1.machineschedule` doc](./machineschedule.md) — reads
+  `slot_size` / `opening_time` / `closing_time` / `advance_booking_days` /
+  `timezone` from this table (with override over `pc1.clients`) when
+  the blank-calendar generator decides the slot window for each
+  facility.
 - [NovaRIS modalities scraper](./novaris_modalities_scraper.md) — the
   consumer of this table's `is_client` flag.

@@ -200,5 +200,9 @@ SELECT facility_id, source_record_key, ris_last_synced_at
 
 - [`pc1.facilities` doc](./facilities.md) — supplies the
   `facility_id` and gates the scraper's iteration via `is_client`.
+- [`pc1.machineschedule` doc](./machineschedule.md) — the slot
+  calendar table whose `modality_id` FK points here. The
+  blank-calendar generator (Phase 2, deferred) walks the active
+  rows in this table to decide which machines to seed slots for.
 - [NovaRIS modalities scraper](./novaris_modalities_scraper.md) — the
   writer.
