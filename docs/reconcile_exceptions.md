@@ -451,46 +451,65 @@ generator: re-run when something upstream has changed. No cron.
 
 Measured on the live Inview Imaging tenant (`client_id = 1`) against
 Supabase, against the May–June 2026 calendar window (31 days,
-`slot_size = 15`, 10-hour business day, 475 active exceptions, 8
-modalities at Inview-Fremont):
+`slot_size = 15`, 10-hour business day, two facilities):
 
-| Stage | Slots in window | Exceptions | Updates issued | Wall time | Notes |
-|---|---|---|---|---|---|
-| `--dry-run` | 23,040 | 475 | 0 (computed 6,312 would-update) | **~15 s** | Reads only; per-exception expansion summary printed. Wall time scales with the cost of the SELECT pagination + Python-side desired-state build. |
-| First real write | 23,808 | 475 | 6,565 across 388 batched UPDATEs (387 distinct payloads, 6 workers) | **~1 m 26 s** | Updates `exceptions[]` / `exception_ids[]` / `availability` / `updated_at`. Payload-grouping collapsed 6,565 row UPDATEs into 388 actual PostgREST round-trips. Throughput ≈ 76 row-updates/sec across all workers. |
-| Idempotent re-run | 23,808 | 475 | **0** | **~14 s** | No DB writes. Pure read + Python compare. Confirms determinism — every row's target state already matches current state. |
+| Stage | Facility | Slots in window | Exceptions | Updates issued | Batches | Distinct payloads | Wall time | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `--dry-run`            | Inview-Fremont  | 23,040 | 475 | 0 (computed 6,312 would-update) | — | — | **~15 s** | Reads only; per-exception expansion summary printed. |
+| First real write       | Inview-Fremont  | 23,808 | 475 | 6,565   | 388 | 387 | **~1 m 26 s** | Throughput ≈ 76 row-updates/sec. |
+| First real write       | Antioch Medical Imaging | 28,800 | 335 | 11,531  | 230 | 224 | **~1 m 21 s** | Throughput ≈ 142 row-updates/sec — almost 2× Fremont's rate despite more updates. See "Why Antioch was faster" below. |
+| Idempotent re-run      | Inview-Fremont  | 23,808 | 475 | **0**   | — | — | **~14 s** | Floor cost (read + Python compare, no DB writes). |
+| Idempotent re-run      | Antioch         | 28,800 | 335 | **0**   | — | — | **~14 s** (extrapolated from full-tenant run) | Same shape — read + compare. |
 
-The dry-run vs. real-write timing difference (~15 s vs ~86 s) is
-almost entirely the cost of the UPDATE round-trips themselves —
-PostgREST UPDATEs against an indexed business key are ~2× slower
-than INSERTs of the same row count, and the 388 sequential batches
-(despite 6 parallel workers) are the dominant cost.
+### Why Antioch was faster despite more updates
 
-The idempotent-re-run time (14 s) is the **floor** for any
-reconciler invocation — it's the cost of:
-1. Reading the active exceptions (~475 rows).
-2. Reading the in-range machineschedule rows (~23,808 rows across
-   24 PostgREST pages of 1000).
+Antioch issued **1.8× as many UPDATEs** as Fremont (11,531 vs 6,565)
+but ran **slightly faster** (1m21s vs 1m26s). Two reasons:
+
+1. **Payload grouping was more effective.** Antioch's 11,531 updates
+   collapsed into just 224 distinct payloads → 230 batches. Fremont's
+   6,565 updates collapsed into 387 distinct payloads → 388 batches.
+   Fewer batches with bigger `WHERE id IN (...)` lists = less
+   per-request overhead.
+2. **More uniform exception coverage.** Antioch averages 35.6 slot
+   entries per exception (11,935 entries / 335 exceptions) vs
+   Fremont's 15.8 (7,500 / 475). Larger exceptions affect more rows
+   with identical payloads → more grouping.
+
+The wall-time scaling is dominated by **batch count**, not by raw
+update count. A facility with many small, divergent exceptions (lots
+of one-off entries with distinct descriptions) will run slower than
+a facility with fewer, broader exceptions even if their total slot
+counts are similar.
+
+### What the floor looks like
+
+The idempotent-re-run time (~14 s per facility) is the **minimum**
+cost for any reconciler invocation against that facility. It's the
+cost of:
+
+1. Reading the active exceptions (a few hundred rows).
+2. Reading the in-range machineschedule rows (~25k–30k rows across
+   ~25–30 PostgREST pages of 1000).
 3. Building the desired-state dict in Python.
 4. Comparing each row's current vs. desired state.
 
 So a routine "nothing changed since last run" reconciler invocation
-costs ~15 s per facility — cheap enough to run after any exception
-edit. The 1 m 26 s cost is what you pay when there are real
-changes to apply.
+against a 2-facility tenant costs ~30 s total — cheap enough to
+re-run after any exception edit. The 1–2 min real-write cost is
+what you pay only when there are real changes to apply.
 
 ### Scaling
 
-Linear in slots-in-window (DB read cost) and slots-needing-update
-(write cost). Doubling the window from 31 → 60 days roughly
-doubles the dry-run time and the real-write time; doubling the
-number of exceptions roughly doubles the desired-state build cost
-but barely affects the write cost (it depends on slot coverage, not
-on exception count).
+| Variable | Effect on wall time |
+|---|---|
+| Window length (days) | Linear on dry-run (more rows to read + compare). Sublinear on writes (rows tend to share payloads regardless of window). |
+| Modality count per facility | Linear on writes (1 modality = 1 set of slots). Linear on reads. |
+| Exception count | Sublinear — adding 100 narrow exceptions costs less than 100 broad ones because narrow ones touch fewer slots. |
+| Workers (`--workers=N`) | Inversely proportional up to ~10–12. Past that, Supabase rate-limits. Default 6 is the sweet spot. |
 
-A 91-day full-tenant horizon across both Antioch (10 modalities) +
-Inview-Fremont (8 modalities) is expected to run in ~5 min real-write
-or ~45 s idempotent re-run.
+A 91-day full-tenant horizon across both facilities is expected to
+run in **~5 min** real-write or **~45 s** idempotent re-run.
 
 ---
 
