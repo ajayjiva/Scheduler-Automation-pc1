@@ -51,34 +51,55 @@ if  slot.start_time is OUTSIDE [opening_time, closing_time):
     # stays).
 else:
     # In business hours -- the reconciler owns this invariant.
-    availability = 0 if any Hard exception covers the slot, else 1
+    availability = 0 if (any Hard exception OR order_id IS NOT NULL)
+                      else 1
 ```
 
-The two halves of this rule are **deliberately split between
-writers**:
+The rule splits **deliberately** between writers, with two
+categories of "blocked":
 
 | Slot category | Owner | Logic |
 |---|---|---|
 | Out-of-hours (`start_time < opening_time` or `>= closing_time`) | Generator | Set to `0` at generation; never modified by reconciler |
-| In-hours, no Hard exception | Reconciler | Set to `1` |
+| In-hours, no Hard exception, no booking | Reconciler | Set to `1` |
 | In-hours, ≥1 Hard exception | Reconciler | Set to `0` |
+| In-hours, booked (`order_id IS NOT NULL`) | Reconciler | Set to `0` (even with no Hard exception) |
+| In-hours, booked AND Hard exception | Reconciler | Set to `0` + emit conflict warning (see below) |
 
 ### Why split this way
 
 Each writer stays in its lane:
 - The generator owns "is this slot physically schedulable?" (i.e.,
   is the door open?).
-- The reconciler owns "is this in-hours slot currently held by a
-  Hard exception?".
+- The reconciler owns "is this in-hours slot currently blocked,
+  either by a Hard exception or by an existing booking?".
 
 If the reconciler tried to flip out-of-hours slots when no Hard
-covered them, two things could go wrong:
-1. A manual SQL UPDATE that intentionally set an out-of-hours slot
-   to `availability=1` (for, say, a special after-hours appointment)
-   would silently get reverted on the next reconcile run.
-2. The reconciler would carry implicit knowledge of "what does
-   in-hours mean for this facility" that's better expressed once,
-   in the generator and the doc.
+covered them, a manual SQL UPDATE that intentionally set an
+out-of-hours slot to `availability=1` (for, say, a special
+after-hours appointment) would silently get reverted on the next
+reconcile run.
+
+### Why `order_id IS NOT NULL` is part of the rule
+
+A slot held by an order is not available for new bookings, full
+stop. Same outcome as a slot under a Hard exception. The Phase 4
+booking workflow will write `(order_id = N, availability = 0)`
+atomically when a booking is recorded — and the reconciler must
+respect that. Without this rule, the very next reconciler run would
+see "in-hours, no Hard, availability != 1" and silently free the
+slot back up.
+
+This is the **load-bearing rule** that lets the booking workflow
+coexist with the reconciler without locking or write-ordering
+ceremony. Both writers compute the same target value from the same
+inputs.
+
+The `exceptions[]` / `exception_ids[]` arrays still describe only
+the active exception rules — never the booking. Reading the arrays
+tells you "what exception rules apply here"; reading `order_id`
+tells you "is this slot held". The two pieces of metadata stay
+orthogonal even though they both contribute to `availability`.
 
 ### `exceptions[]` / `exception_ids[]` are always populated
 
@@ -248,39 +269,78 @@ DELETE FROM pc1.scheduleexceptions
 
 ## Booked-slot Hard-exception conflict
 
-When the reconciler computes a target state with at least one Hard
-marker for a slot whose `order_id IS NOT NULL`:
+A slot can become both booked AND covered by a Hard exception
+(e.g., someone adds a `STAFF MEETING` Hard exception that overlaps
+an existing appointment). When the reconciler detects this state,
+it:
 
-1. The update is **still written** normally — arrays + availability
-   per the rules above. The exception IS active; the operator just
-   needs to know.
-2. A conflict record is collected:
+1. **Writes the update normally** — arrays + `availability=0`. The
+   Hard exception IS active; the slot stays blocked.
+2. Collects a conflict record:
    `(slot_id, order_id, modality_id, modality_machine, date_and_time_utc, start_time_local, hard_exceptions)`.
-3. At the end of the run, a `CONFLICTS` section is printed listing
-   each booked-but-now-exception-covered slot.
-4. The process exits with code **4** (distinct from `0`=clean,
-   `1`=fatal, `3`=facility-skipped-due-to-bad-config).
+3. At the end of the run, prints a `CONFLICTS` section listing each
+   booked-but-now-Hard-covered slot.
+4. Exits with code **4** (distinct from `0`=clean, `1`=fatal,
+   `3`=facility-skipped-due-to-bad-config).
 
-This code path activates only once Phase 4's orders work starts
-populating `order_id`. To **manually test** in Phase 3:
+The Phase 4 booking workstream populates `order_id`, so this path
+fires for real only after Phase 4 ships. To **manually test** in
+Phase 3:
 
 ```sql
--- After a successful reconciler run, find a slot that ended up
--- with a Hard exception and pretend it was booked:
+-- 1) Find a slot that already has a Hard exception applied. Pick
+-- one from the spot-check query's top entries (e.g. the slot at
+-- exception_ids ['95604']) -- those rows already have arrays set
+-- and availability=0:
+SELECT id, date_and_time_utc, start_time, modality_id, exceptions
+  FROM pc1.machineschedule
+ WHERE exception_ids @> ARRAY['95604']
+ LIMIT 1;
+-- Copy the id from the result.
+
+-- 2) Clear the slot's exception arrays AND fake-book it. This
+-- forces the reconciler to detect a state mismatch (current empty
+-- arrays != desired Hard exception arrays) AND see order_id, so
+-- the warning fires:
 UPDATE pc1.machineschedule
-   SET order_id = 9999
- WHERE id = <some_id_with_hard_in_exceptions>;
+   SET exceptions    = '{}',
+       exception_ids = '{}',
+       order_id      = 9999
+ WHERE id = <the_id>;
 
--- Then re-run the reconciler:
+-- 3) Re-run the reconciler:
 -- python reconcile_exceptions.py --facility=<NAME>
--- Expect: "CONFLICTS" section listing this slot; exit code 4.
+-- Expect:
+--   * "DONE -- 1 slots updated"
+--   * "CONFLICTS" section listing this slot
+--   * Process exits with code 4
 
--- Clean up after testing:
-UPDATE pc1.machineschedule SET order_id = NULL WHERE id = <some_id>;
+-- 4) Clean up:
+UPDATE pc1.machineschedule SET order_id = NULL WHERE id = <the_id>;
+-- Re-run reconciler; should show 0 updates and exit code 0.
 ```
 
-After running the cleanup, re-running the reconciler should produce
-zero updates (idempotent) and exit code 0.
+### Why the test recipe clears the arrays
+
+If you just set `order_id = 9999` on a slot whose arrays already
+match (because a previous reconciler run already populated them),
+no UPDATE is needed and the warning won't fire. The CONFLICTS
+section only lists rows that the reconciler **actually writes** in
+that invocation. Clearing the arrays forces a write so the warning
+path executes.
+
+This is the right design for ongoing operations — the warning
+fires on each Hard exception that *newly* impacts a booked slot,
+not every time the reconciler sweeps over an already-resolved
+conflict. Operators can find currently-conflicting slots with:
+
+```sql
+SELECT id, order_id, date_and_time_utc, start_time, exceptions
+  FROM pc1.machineschedule
+ WHERE order_id IS NOT NULL
+   AND EXISTS (SELECT 1 FROM unnest(exceptions) AS e
+                WHERE e LIKE '% (H)' OR e LIKE '%(H)');
+```
 
 ---
 
@@ -371,20 +431,27 @@ SELECT count(*)
  WHERE coalesce(array_length(exceptions, 1), 0)
     <> coalesce(array_length(exception_ids, 1), 0);
 
--- 2) Availability-vs-Hard invariant for IN-HOURS slots (should be 0)
--- Any in-hours slot with a Hard marker must have availability=0;
--- any in-hours slot with no Hard marker must have availability=1.
-SELECT ms.id, ms.start_time, ms.availability, ms.exceptions,
-       f.opening_time, f.closing_time
+-- 2) Availability-vs-(Hard|booked) invariant for IN-HOURS slots
+-- (should be 0). Any in-hours slot with a Hard marker OR an order
+-- must have availability=0; any in-hours slot with NEITHER must
+-- have availability=1.
+SELECT ms.id, ms.start_time, ms.availability, ms.order_id,
+       ms.exceptions, f.opening_time, f.closing_time
   FROM pc1.machineschedule ms
   JOIN pc1.facilities      f ON f.id = ms.facility_id
  WHERE ms.start_time >= f.opening_time
    AND ms.start_time <  f.closing_time
    AND (
+       -- availability=1 but slot is blocked (Hard exception OR booked)
        (ms.availability = 1
-        AND EXISTS (SELECT 1 FROM unnest(ms.exceptions) AS e
-                     WHERE e LIKE '% (H)' OR e LIKE '%(H)'))
+        AND (
+            ms.order_id IS NOT NULL
+            OR EXISTS (SELECT 1 FROM unnest(ms.exceptions) AS e
+                        WHERE e LIKE '% (H)' OR e LIKE '%(H)')
+        ))
+       -- availability=0 but slot is unblocked (no Hard AND not booked)
     OR (ms.availability = 0
+        AND ms.order_id IS NULL
         AND NOT EXISTS (SELECT 1 FROM unnest(ms.exceptions) AS e
                          WHERE e LIKE '% (H)' OR e LIKE '%(H)'))
    );

@@ -25,13 +25,23 @@ For each slot:
         availability remains whatever the row currently shows
     else:
         # Slot is in business hours.
-        availability = 0 if any Hard exception applies, else 1
+        availability = 0 if (any Hard exception OR order_id NOT NULL)
+                          else 1
+
+`order_id IS NOT NULL` is treated as another blocker because a
+slot held by an order isn't available for new bookings, full stop.
+Without this rule, a future booking workflow that flips
+availability=0 alongside order_id=N would silently get reverted on
+the next reconciler run -- the reconciler would see "in-hours, no
+Hard, availability != 1" and "fix" it. The Phase 4 booking
+workstream depends on this.
 
 This separation -- generator owns out-of-hours, reconciler owns
-in-hours exception state -- keeps each writer in its lane and avoids
-the "did the reconciler accidentally re-open a 22:00 slot?" footgun.
-See docs/machineschedule.md -> "Exception overlay invariants" for
-the documented rule.
+in-hours (exception + booking) state -- keeps each writer in its
+lane and avoids the "did the reconciler accidentally re-open a
+22:00 slot?" / "did the reconciler accidentally free up a booking?"
+footguns. See docs/machineschedule.md -> "Exception overlay
+invariants" for the documented rule.
 
 The exceptions[] / exception_ids[] arrays are populated for EVERY
 matching slot regardless of business hours -- so a LUNCH exception
@@ -460,8 +470,15 @@ def reconcile_row(
       * If slot_start_t is outside [opening_time, closing_time),
         availability stays whatever the row currently shows -- the
         reconciler does not own the out-of-hours invariant.
-      * Otherwise (in business hours): 0 if any Hard marker present,
+      * Otherwise (in business hours): 0 if EITHER any Hard marker
+        is present OR the slot is booked (order_id IS NOT NULL),
         else 1.
+
+    Treating order_id IS NOT NULL as a blocker mirrors the booking
+    code's mental model ("this slot is held; it can't be offered")
+    and prevents the reconciler from silently freeing up booked
+    slots when no Hard exception covers them. Phase 4 booking
+    workflow depends on this rule.
     """
     desired_sorted = sorted(desired_for_slot, key=lambda x: x[0])
     new_ids   = [k for (k, _d, _m) in desired_sorted]
@@ -469,8 +486,9 @@ def reconcile_row(
 
     in_hours = opening_time <= slot_start_t < closing_time
     has_hard = any(m == "H" for (_k, _d, m) in desired_sorted)
+    has_order = row.get("order_id") is not None
     if in_hours:
-        new_avail = 0 if has_hard else 1
+        new_avail = 0 if (has_hard or has_order) else 1
     else:
         # Don't touch availability -- generator owns this invariant.
         new_avail = row.get("availability")
