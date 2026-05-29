@@ -94,7 +94,7 @@ been standardized and tightened during the rewrite (see §4).
 | [`docs/modalities.md`](./modalities.md) | `pc1.modalities` schema — one row per physical machine. Business key, content_hash composition, lifecycle |
 | [`docs/proceduresestimate.md`](./proceduresestimate.md) | `pc1.proceduresestimate` schema — procedure catalog. Four-shape per-machine override design. Cross-tenant trigger semantics |
 | [`docs/scheduleexceptions.md`](./scheduleexceptions.md) | `pc1.scheduleexceptions` schema — scheduling-exception rules (LUNCH, holidays, downtime). Flat recurrence-mask columns, CHECK-constrained `recurrence`/`type`, no override pattern |
-| [`docs/machineschedule.md`](./machineschedule.md) | `pc1.machineschedule` schema — slot calendar. Generator-produced (not RIS-sourced), so no `is_active`/`content_hash`/`ris_*`. UTC `date_and_time` with facility-local convenience columns. Paired `exceptions`/`exception_ids` arrays. `order_id` FK deferred to Phase 4 |
+| [`docs/machineschedule.md`](./machineschedule.md) | `pc1.machineschedule` schema — slot calendar. Generator-produced (not RIS-sourced), so no `is_active`/`content_hash`/`ris_*`. UTC `date_and_time_utc` plus facility-local `start_time` / `end_time` / `seq` (the engine-contract `YYYYMMDDHHMMSS` integer). Paired `exceptions`/`exception_ids` arrays. `order_id` FK deferred to Phase 4 |
 | [`docs/machineschedule_generator.md`](./machineschedule_generator.md) | `generate_machineschedule.py` — Phase 2 writer for the slot calendar. 24-hour day generation, facility-local → UTC via `zoneinfo`, ON CONFLICT DO NOTHING idempotency, modality filter (`is_active=true AND status IN ('Active', NULL)`). No destructive flags — wipe is SQL-only |
 | [`docs/novaris_modalities_scraper.md`](./novaris_modalities_scraper.md) | The first NovaRIS scraper — reference for per-facility iteration, login flow, runtime facility-id resolution |
 | [`docs/novaris_standardprocedure_scraper.md`](./novaris_standardprocedure_scraper.md) | The second NovaRIS scraper — reference for per-modality iteration, two-pass (grid → wizard) scrape, ThreadPoolExecutor for parallel detail fetches |
@@ -185,7 +185,16 @@ documented vocabulary so scraper bugs fail at INSERT time. Pattern:
     No `is_active` / `content_hash` / `source_record_key` / `ris_*`
     (slots are generator-produced, not RIS-sourced). `order_id`
     column present but FK to `pc1.orders` deferred until Phase 4.
-  - **Next available number: 0005**
+    The `date_and_time` column was renamed in 0005 — see below.
+  - `0005_rename_machineschedule_dt_to_utc.sql` — renames
+    `pc1.machineschedule.date_and_time` to `date_and_time_utc` so
+    the UTC nature is explicit on every read (matches the
+    facility-LOCAL `start_time` / `end_time` columns by contrast).
+    Idempotent via an `information_schema` guard. Discovered during
+    Phase 2 verification; see `docs/machineschedule.md` →
+    [The `seq` engine contract](./machineschedule.md#the-seq-engine-contract)
+    for the related `seq` column semantics agreed at the same time.
+  - **Next available number: 0006**
 
 ### 4.4 Scraper conventions
 
@@ -364,7 +373,7 @@ The forward roadmap, in execution order:
 
 | # | Item | Status | Notes |
 |---|---|---|---|
-| 1 | Port **`pc1.machineschedule`** — the slot calendar | **Phase 2 IN PROGRESS** — schema migration `0004` shipped (PR #7); `generate_machineschedule.py` + `docs/machineschedule_generator.md` on `feature/pc1-machineschedule-generator`. Phase 3 (reconciler) still pending — see §8 | Generates blank availability slots per `(modality, date_and_time)` for a rolling window. Legacy: `create_blank_calendar.py` |
+| 1 | Port **`pc1.machineschedule`** — the slot calendar | **Phase 2 IN PROGRESS** — schema migration `0004` shipped (PR #7); `generate_machineschedule.py` + `docs/machineschedule_generator.md` + post-verification fixup (migration `0005` column rename to `date_and_time_utc`, `seq` populated as facility-local YYYYMMDDHHMMSS) on `feature/pc1-machineschedule-generator` (PR #8). Phase 3 (reconciler) still pending — see §8 | Generates blank availability slots per `(modality, date_and_time_utc)` for a rolling window. Legacy: `create_blank_calendar.py` |
 | 2 | Port **`reconcile_exceptions.py`** | Deferred — depends on (1) Phase 2 landing first | Reads active `pc1.scheduleexceptions`, expands recurrence rules to slot-level, surgically updates `pc1.machineschedule.availability` + `exceptions[]` + `exception_ids[]`. Existing legacy script in repo is a strong starting point — it just needs pc1-schema adaptation |
 | 3 | Scrape **patient orders** into `pc1.orders` | Deferred — needed to drive the scheduling engine | Source page in NovaRIS TBD (likely `Orders.aspx` or similar). May or may not need a two-pass scrape. New table; two-phase PR pattern applies |
 | 4 | Port scheduling engine (patient-options builder) | Deferred — depends on (1), (2), (3) | Core business logic; legacy `main.py`. Compute appointment options for patients with multiple orders across multiple modalities |

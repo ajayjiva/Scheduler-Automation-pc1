@@ -17,16 +17,17 @@ Schema mapping
 For each (active modality, facility-local date in window, slot start
 in 24-hour day):
 
-    client_id      <- --client-id (resolve_client_id)
-    facility_id    <- pc1.facilities.id (lookup by facility_name)
-    modality_id    <- pc1.modalities.id (active rows for the facility)
-    seq            <- NULL (reserved for future engine use)
-    slot_seq       <- 1-based ordinal within the facility-local day
-    date_and_time  <- UTC instant (facility-local wall clock converted
-                      via zoneinfo)
-    start_time     <- facility-local time-of-day
-    end_time       <- start_time + slot_size (wraps to 00:00 at the
-                      end of the day when slot_size divides 24h cleanly)
+    client_id          <- --client-id (resolve_client_id)
+    facility_id        <- pc1.facilities.id (lookup by facility_name)
+    modality_id        <- pc1.modalities.id (active rows for the facility)
+    seq                <- facility-local YYYYMMDDHHMMSS bigint of slot start
+                          (engine extracts the local DATE via str(seq)[:8])
+    slot_seq           <- 1-based ordinal within the facility-local day
+    date_and_time_utc  <- UTC instant (facility-local wall clock converted
+                          via zoneinfo)
+    start_time         <- facility-local time-of-day
+    end_time           <- start_time + slot_size (wraps to 00:00 at the
+                          end of the day when slot_size divides 24h cleanly)
     capacity       <- 1
     availability   <- 1 (free; reconciler may flip to 0 later)
     scheduled      <- NULL (reserved)
@@ -66,14 +67,14 @@ nullable on the facility row.
 Idempotency
 -----------
 INSERT ... ON CONFLICT (client_id, facility_id, modality_id,
-date_and_time) DO NOTHING. Re-running over an already-generated window
-is a safe no-op. Use the SQL command below if you need to wipe slots
-before regenerating:
+date_and_time_utc) DO NOTHING. Re-running over an already-generated
+window is a safe no-op. Use the SQL command below if you need to wipe
+slots before regenerating:
 
     DELETE FROM pc1.machineschedule
-     WHERE client_id   = <ID>
-       AND facility_id = <ID>
-       AND date_and_time >= '<ISO>'::timestamptz;
+     WHERE client_id         = <ID>
+       AND facility_id       = <ID>
+       AND date_and_time_utc >= '<ISO>'::timestamptz;
 
 DST behavior
 ------------
@@ -275,20 +276,30 @@ def _build_records_for_modality(
         for slot_seq, start_t, end_t in slot_times:
             local_dt = datetime.combine(d, start_t).replace(tzinfo=tz)
             utc_dt   = local_dt.astimezone(timezone.utc)
+            # `seq` encodes the slot's FACILITY-LOCAL start instant as
+            # a YYYYMMDDHHMMSS bigint. The scheduling engine extracts
+            # the local DATE via `str(seq)[:8]` (see legacy
+            # next_modalitytype_scheduler.same_day() and
+            # all_modality_scheduler.build_chain_for_anchor()), so the
+            # value MUST be facility-local -- a UTC-based seq would
+            # mis-group every evening slot whose UTC date is the next
+            # local day.
+            seq_local = int(local_dt.strftime("%Y%m%d%H%M%S"))
             records.append({
-                "client_id":     client_id,
-                "facility_id":   facility_id,
-                "modality_id":   modality_id,
-                "slot_seq":      slot_seq,
-                "date_and_time": utc_dt.isoformat(),
-                "start_time":    start_t.isoformat(),
-                "end_time":      end_t.isoformat(),
-                "capacity":      1,
-                "availability":  1,
-                "exceptions":    [],
-                "exception_ids": [],
-                "created_at":    now_iso,
-                "updated_at":    now_iso,
+                "client_id":         client_id,
+                "facility_id":       facility_id,
+                "modality_id":       modality_id,
+                "seq":               seq_local,
+                "slot_seq":          slot_seq,
+                "date_and_time_utc": utc_dt.isoformat(),
+                "start_time":        start_t.isoformat(),
+                "end_time":          end_t.isoformat(),
+                "capacity":          1,
+                "availability":      1,
+                "exceptions":        [],
+                "exception_ids":     [],
+                "created_at":        now_iso,
+                "updated_at":        now_iso,
             })
         d += timedelta(days=1)
     return records
@@ -306,7 +317,7 @@ def _insert_with_skip_dupes(supabase, records: list) -> int:
     for batch in _chunked(records, INSERT_BATCH_SIZE):
         _table(supabase, "machineschedule").upsert(
             batch,
-            on_conflict="client_id,facility_id,modality_id,date_and_time",
+            on_conflict="client_id,facility_id,modality_id,date_and_time_utc",
             ignore_duplicates=True,
         ).execute()
         total += len(batch)
@@ -326,8 +337,8 @@ def _count_existing_in_range(supabase, client_id: int, facility_id: int,
         .select("id", count="exact")
         .eq("client_id", client_id)
         .eq("facility_id", facility_id)
-        .gte("date_and_time", utc_start_iso)
-        .lt("date_and_time", utc_end_iso)
+        .gte("date_and_time_utc", utc_start_iso)
+        .lt("date_and_time_utc", utc_end_iso)
         .limit(1)
         .execute()
     )

@@ -27,8 +27,9 @@ start in a 24-hour day)`, one row is INSERTed with:
 | `client_id`     | resolved tenant (`--client-id`, env, or default) |
 | `facility_id`   | `pc1.facilities.id` for this facility |
 | `modality_id`   | `pc1.modalities.id` for an active machine |
+| `seq`           | **facility-local** `YYYYMMDDHHMMSS` bigint of the slot start (e.g. `20260528083000` for 08:30 PT on 2026-05-28). Engine extracts the local date via `str(seq)[:8]` — see [`docs/machineschedule.md` → The `seq` engine contract](./machineschedule.md#the-seq-engine-contract) |
 | `slot_seq`      | 1-based ordinal of the slot within its facility-local day |
-| `date_and_time` | UTC instant (facility-local wall clock → UTC via `zoneinfo`) |
+| `date_and_time_utc` | UTC instant (facility-local wall clock → UTC via `zoneinfo`) |
 | `start_time`    | facility-local time of slot start (`08:00:00`, `08:15:00`, ...) |
 | `end_time`      | `start_time + slot_size`; wraps to `00:00:00` for the last slot |
 | `capacity`      | `1` |
@@ -39,9 +40,8 @@ start in a 24-hour day)`, one row is INSERTed with:
 | `updated_at`    | now (UTC) |
 
 Left `NULL` at generation time (other writers populate later):
-`seq` (reserved for future engine use), `scheduled` (future booking
-bookkeeping), `order_id` (Phase 4 — booking), `created_by` /
-`updated_by` (automated write).
+`scheduled` (future booking bookkeeping), `order_id` (Phase 4 —
+booking), `created_by` / `updated_by` (automated write).
 
 ---
 
@@ -112,7 +112,7 @@ newly-contracted facility before flipping its `is_client` flag.
 ## Idempotency
 
 The generator uses
-`INSERT ... ON CONFLICT (client_id, facility_id, modality_id, date_and_time) DO NOTHING`
+`INSERT ... ON CONFLICT (client_id, facility_id, modality_id, date_and_time_utc) DO NOTHING`
 on the table's business-key UNIQUE constraint. Re-running over an
 already-generated window is a safe no-op — every conflicting row is
 silently skipped server-side, no UPDATE issued, no audit-column churn.
@@ -146,7 +146,7 @@ DELETE FROM pc1.machineschedule
    AND facility_id   = (SELECT id FROM pc1.facilities
                          WHERE client_id    = <CLIENT_ID>
                            AND facility_name = '<FACILITY_NAME>')
-   AND date_and_time >= '<YYYY-MM-DD>'::timestamptz;
+   AND date_and_time_utc >= '<YYYY-MM-DD>'::timestamptz;
 ```
 
 Then re-run the generator. The DELETE is intentionally NOT exposed as
@@ -281,7 +281,7 @@ the shape of what landed:
 -- * (number of active modalities) for every facility-local day in the
 -- window. Adjust the time zone in the date_trunc to your facility's.
 SELECT date_trunc('day',
-                   date_and_time AT TIME ZONE 'America/Los_Angeles')::date
+                   date_and_time_utc AT TIME ZONE 'America/Los_Angeles')::date
          AS facility_local_day,
        count(*) AS slot_count
   FROM pc1.machineschedule
@@ -289,8 +289,8 @@ SELECT date_trunc('day',
    AND facility_id = (SELECT id FROM pc1.facilities
                        WHERE client_id    = 1
                          AND facility_name = 'Inview-Fremont')
-   AND date_and_time >= now()
-   AND date_and_time <  now() + interval '7 days'
+   AND date_and_time_utc >= now()
+   AND date_and_time_utc <  now() + interval '7 days'
  GROUP BY 1
  ORDER BY 1;
 
@@ -309,8 +309,8 @@ SELECT distinct slot_seq
    AND facility_id = (SELECT id FROM pc1.facilities
                        WHERE client_id    = 1
                          AND facility_name = 'Inview-Fremont')
-   AND date_and_time >= (current_date)::timestamptz
-   AND date_and_time <  ((current_date + 1))::timestamptz
+   AND date_and_time_utc >= (current_date)::timestamptz
+   AND date_and_time_utc <  ((current_date + 1))::timestamptz
  ORDER BY slot_seq;
 ```
 
