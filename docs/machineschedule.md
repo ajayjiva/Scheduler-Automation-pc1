@@ -1,7 +1,7 @@
 # `pc1.machineschedule`
 
 The slot calendar. One row per
-`(client_id, facility_id, modality_id, date_and_time)` representing a
+`(client_id, facility_id, modality_id, date_and_time_utc)` representing a
 bookable time slot on a single machine. This is the table the
 blank-calendar generator (Phase 2, deferred) populates and the
 exception reconciler (Phase 3, deferred) mutates, and the scheduling
@@ -22,7 +22,7 @@ diff against.
 | Concept           | Field(s)                                                          |
 |-------------------|-------------------------------------------------------------------|
 | Surrogate PK      | `id`                                                              |
-| **Business key**  | `(client_id, facility_id, modality_id, date_and_time)`            |
+| **Business key**  | `(client_id, facility_id, modality_id, date_and_time_utc)`            |
 
 The business key is enforced via a regular `UNIQUE` constraint (not a
 partial index): every slot has all four columns set. There is no
@@ -52,9 +52,9 @@ on re-runs.
 
 | Column          | Type                       | Null? | Notes |
 |-----------------|----------------------------|-------|-------|
-| `seq`           | `bigint`                   | YES   | Legacy carryover. Reserved for future engine use; not written by the generator. |
-| `slot_seq`      | `integer`                  | YES   | 1-based ordinal of the slot within its facility-local day (slot at 08:00 → `1`, next at 08:15 → `2`, etc., when `slot_size = 15`). Useful for ordering within a single date without re-deriving from `date_and_time`. |
-| `date_and_time` | `timestamptz`              | NO    | **UTC.** The instant the slot starts. The generator iterates facility-local wall clock and converts at write time via `zoneinfo`. See [Time-zone semantics](#time-zone-semantics). |
+| `seq`           | `bigint`                   | YES   | **Facility-local `YYYYMMDDHHMMSS`** of the slot start, encoded as a single integer (e.g. `20260528083000` = `2026-05-28 08:30:00` facility-local). See [The `seq` engine contract](#the-seq-engine-contract) below for why it's local-not-UTC. Populated by the generator. |
+| `slot_seq`      | `integer`                  | YES   | 1-based ordinal of the slot within its facility-local day (slot at 08:00 → `1`, next at 08:15 → `2`, etc., when `slot_size = 15`). Useful for ordering within a single date without re-deriving from `date_and_time_utc`. |
+| `date_and_time_utc` | `timestamptz`              | NO    | **UTC.** The instant the slot starts. The generator iterates facility-local wall clock and converts at write time via `zoneinfo`. The `_utc` suffix is intentional — `start_time` and `end_time` on the same row carry facility-LOCAL clock values, so the contrasting name prevents misreading. See [Time-zone semantics](#time-zone-semantics). |
 | `start_time`    | `time without time zone`   | YES   | Facility-local start time of the slot (e.g. `08:00:00`). Carried for the scheduling engine, which constructs human-readable patient-option output without re-running the UTC↔local conversion. |
 | `end_time`      | `time without time zone`   | YES   | Facility-local end time, i.e. `start_time + slot_size`. Same rationale. |
 
@@ -63,7 +63,7 @@ on re-runs.
 | Column         | Type      | Null? | Default | Notes |
 |----------------|-----------|-------|---------|-------|
 | `capacity`     | `integer` | YES   | —       | Generator writes `1`. Reserved for future multi-patient slot support; nothing currently consumes a non-1 value. |
-| `availability` | `integer` | YES   | —       | `0` = blocked, `1` = free. Generator writes `1`; the reconciler drops it to `0` for slots covered by a Hard exception. |
+| `availability` | `integer` | YES   | —       | `0` = blocked, `1` = free. Generator writes `1` for slots whose `start_time` falls in the facility's half-open `[opening_time, closing_time)` business-hours window, `0` otherwise (out-of-hours slots are never offered to patients). The reconciler may further drop in-hours slots to `0` when a Hard exception covers them. See [`docs/machineschedule_generator.md` → Initial availability and business hours](./machineschedule_generator.md#initial-availability-and-business-hours). |
 | `scheduled`    | `integer` | YES   | —       | Reserved for future booking-state bookkeeping (e.g. partial counts when `capacity > 1`). Not currently written. |
 
 ### Exception overlays
@@ -94,7 +94,7 @@ overlay invariants](#exception-overlay-invariants).
 | Column / pattern | Why omitted |
 |---|---|
 | `is_active` | Slots aren't soft-deleted. There's no upstream RIS to disappear; a slot either exists (because the generator put it there) or doesn't. |
-| `source_record_key` | Slots are not RIS rows. The `(client_id, facility_id, modality_id, date_and_time)` business key already uniquely identifies a slot. |
+| `source_record_key` | Slots are not RIS rows. The `(client_id, facility_id, modality_id, date_and_time_utc)` business key already uniquely identifies a slot. |
 | `content_hash` | Delta-sync diffing doesn't apply — there's nothing to diff against. The generator inserts via `ON CONFLICT DO NOTHING`; the reconciler decides per-row whether the desired state already matches before writing. |
 | `ris_system` / `ris_sync_status` / `ris_last_synced_at` / `ris_metadata` / `synced_at` | All four are source-system tracking. Not applicable. |
 | `cumm_open_slots_below` / `cumm_open_slots_above` (legacy) | The legacy table cached cumulative open-slot counts at generation time. Stale-data footgun: every reconciler write would have to recompute and rewrite them, or readers would see lies. The scheduling engine recomputes in-process from `availability`. |
@@ -127,7 +127,7 @@ forking the tenant.
 
 ## Time-zone semantics
 
-`date_and_time` is `timestamptz` storing UTC. The legacy public-schema
+`date_and_time_utc` is `timestamptz` storing UTC. The legacy public-schema
 table stored `timestamp without time zone` and was later migrated to
 UTC behind the scenes; pc1 ships UTC-from-day-one so the type itself
 encodes the contract — no future "what timezone is this column in?"
@@ -140,7 +140,7 @@ for each calendar day d in [today, today + advance_booking_days]:
     for each slot s in [opening_time, closing_time) stepping by slot_size:
         local_dt = datetime(d, s, tzinfo = ZoneInfo(facility.timezone))
         utc_dt   = local_dt.astimezone(timezone.utc)
-        INSERT ... date_and_time = utc_dt,
+        INSERT ... date_and_time_utc = utc_dt,
                    start_time   = s,
                    end_time     = s + slot_size,
                    slot_seq     = <ordinal within d>
@@ -159,6 +159,64 @@ worked example.
 
 ---
 
+## The `seq` engine contract
+
+`seq` is a compact `YYYYMMDDHHMMSS` integer of the slot's
+**facility-local** start instant. For the slot starting at 08:30 PT
+on 2026-05-28, `seq = 20260528083000`.
+
+It exists to give the scheduling engine a single-integer
+day-and-time key that:
+
+- Sorts chronologically (integer comparison)
+- Slices to extract just the day: `str(seq)[:8] = '20260528'`
+- Aligns with `start_time` / `end_time` on the same row (all three
+  are facility-local)
+
+### Why facility-LOCAL and not UTC
+
+The legacy scheduling engine — and the planned Phase 4 port — uses
+`str(seq)[:8]` as the **same-day key** when searching for adjacent
+modality blocks within a single visit. For example:
+
+```python
+# next_modalitytype_scheduler.py (legacy)
+def same_day(seq1, seq2):
+    return str(seq1)[:8] == str(seq2)[:8]
+```
+
+Consider a slot at **23:00 PT on 2026-05-28** (= 06:00 UTC on
+2026-05-29):
+
+| `seq` flavor                            | `seq[:8]`     | Engine sees |
+|-----------------------------------------|---------------|---|
+| **LOCAL** `20260528230000`              | `'20260528'`  | ✅ Same local day as the 09:00 PT slot of 2026-05-28 — chain can pair an MRI with adjacent CT before/after |
+| **UTC** `20260529060000` (legacy-style) | `'20260529'`  | ❌ Different day — engine thinks the slot belongs to 5/29; never pairs it with morning 5/28 slots |
+
+A UTC `seq` would silently break multi-modality scheduling for every
+evening slot in a non-UTC time zone. The generator therefore writes
+`seq` from `datetime.combine(facility_local_date, slot_start_time)`,
+not from `date_and_time_utc`.
+
+### Invariant the generator maintains
+
+For every row:
+
+```
+str(seq)[:8] == to_char(date_and_time_utc AT TIME ZONE
+                        facilities.timezone, 'YYYYMMDD')
+```
+
+This holds across DST transitions because the generator uses
+`zoneinfo` to compute both sides (the LOCAL clock for `seq`, and the
+UTC instant for `date_and_time_utc`) from the same source datetime.
+
+A verification SQL that flags any rows violating the invariant is
+included in [Verification queries](#verification-queries-post-migration)
+below.
+
+---
+
 ## Exception overlay invariants
 
 `exceptions` and `exception_ids` are **paired positionally**: element
@@ -173,8 +231,14 @@ the sole maintainer of both arrays. Its contract:
 3. `exceptions` element format is `'<description> (<marker>)'` where
    `<marker>` is `H` for Hard or `S` for Soft. Empty description is
    allowed: `' (H)'`.
-4. `availability` is `0` when any element has marker `H`, else `1`.
-   The reconciler enforces this invariant on every write.
+4. `availability` is `0` when **any** of the following is true:
+   (a) any `exceptions` element has marker `H` (Hard), OR
+   (b) the slot's `start_time` falls outside the facility's
+       `[opening_time, closing_time)` business-hours window.
+   Otherwise `availability = 1`. The reconciler must preserve the
+   business-hours portion of this invariant — see the generator doc
+   ([Initial availability and business hours](./machineschedule_generator.md#initial-availability-and-business-hours))
+   for the rule.
 
 Postgres can't enforce paired-length or any of the above without a
 trigger. We accept the discipline-enforced contract because the single
@@ -225,7 +289,7 @@ state machine. The writers are:
 
 | Writer | Phase | Touches | Conflict handling |
 |---|---|---|---|
-| Generator (Phase 2) | Insert blank rows over a rolling window | All columns at INSERT | `ON CONFLICT (client_id, facility_id, modality_id, date_and_time) DO NOTHING` — re-runs are no-ops on already-existing slots |
+| Generator (Phase 2) | Insert blank rows over a rolling window | All columns at INSERT | `ON CONFLICT (client_id, facility_id, modality_id, date_and_time_utc) DO NOTHING` — re-runs are no-ops on already-existing slots |
 | Reconciler (Phase 3) | UPDATE `exceptions`, `exception_ids`, `availability`, `updated_at` for slots whose desired exception state differs from current | Three columns + audit | Per-row pre-check: skip the UPDATE entirely when current state already matches desired (idempotent re-runs cost reads only) |
 | Engine / booking (Phase 4) | UPDATE `order_id` (and eventually `scheduled`) when a booking is recorded | `order_id` + audit | TBD — Phase 4 will decide whether to use optimistic locking, advisory locks, or `SELECT FOR UPDATE` |
 
@@ -241,37 +305,49 @@ rows (if it ever becomes a concern) is the operator's call.
 ```sql
 -- All slots for a facility on a specific facility-local day.
 -- IMPORTANT: convert the local day boundary to UTC before filtering.
-SELECT ms.id, ms.date_and_time, ms.start_time, ms.modality_id,
+SELECT ms.id, ms.date_and_time_utc, ms.start_time, ms.modality_id,
        ms.availability, ms.exceptions
   FROM pc1.machineschedule ms
  WHERE ms.client_id   = 1
    AND ms.facility_id = 42
-   AND ms.date_and_time >= '2026-06-15 07:00:00+00'  -- 00:00 PT
-   AND ms.date_and_time <  '2026-06-16 07:00:00+00'  -- 00:00 PT next day
- ORDER BY ms.modality_id, ms.date_and_time;
+   AND ms.date_and_time_utc >= '2026-06-15 07:00:00+00'  -- 00:00 PT
+   AND ms.date_and_time_utc <  '2026-06-16 07:00:00+00'  -- 00:00 PT next day
+ ORDER BY ms.modality_id, ms.date_and_time_utc;
 
 -- Find all slots affected by a specific exception (uses GIN index)
-SELECT id, modality_id, date_and_time, exceptions
+SELECT id, modality_id, date_and_time_utc, exceptions
   FROM pc1.machineschedule
  WHERE client_id = 1
    AND exception_ids @> ARRAY['58713'];
 
 -- All free, unbooked slots for a machine over the next 30 days
-SELECT date_and_time, start_time, end_time
+SELECT date_and_time_utc, start_time, end_time
   FROM pc1.machineschedule
  WHERE client_id    = 1
    AND modality_id  = 12
-   AND date_and_time >= now()
-   AND date_and_time <  now() + interval '30 days'
+   AND date_and_time_utc >= now()
+   AND date_and_time_utc <  now() + interval '30 days'
    AND availability = 1
    AND order_id IS NULL
- ORDER BY date_and_time;
+ ORDER BY date_and_time_utc;
 
 -- All slots booked against a given order
-SELECT id, modality_id, date_and_time, start_time, end_time
+SELECT id, modality_id, date_and_time_utc, start_time, end_time
   FROM pc1.machineschedule
  WHERE order_id = 12345
- ORDER BY date_and_time;
+ ORDER BY date_and_time_utc;
+
+-- Spot-check the seq engine contract (should return zero rows):
+-- str(seq)[:8] must equal the facility-local YYYYMMDD of the slot.
+SELECT ms.id,
+       ms.seq,
+       substring(ms.seq::text, 1, 8) AS seq_day,
+       to_char(ms.date_and_time_utc AT TIME ZONE f.timezone,
+               'YYYYMMDD')             AS local_day
+  FROM pc1.machineschedule ms
+  JOIN pc1.facilities      f ON f.id = ms.facility_id
+ WHERE substring(ms.seq::text, 1, 8)
+    <> to_char(ms.date_and_time_utc AT TIME ZONE f.timezone, 'YYYYMMDD');
 
 -- Spot-check the paired-array invariant (should return zero rows)
 SELECT id, array_length(exceptions, 1) AS n_excs,
@@ -288,6 +364,31 @@ SELECT id, availability, exceptions
        SELECT 1 FROM unnest(exceptions) AS e
         WHERE e LIKE '% (H)'
    );
+
+-- Spot-check the availability-vs-business-hours invariant (should
+-- return zero rows). Any in-hours slot must have availability=1
+-- unless a Hard exception covers it; any out-of-hours slot must have
+-- availability=0 regardless of exceptions.
+SELECT ms.id, ms.start_time, ms.availability,
+       f.opening_time, f.closing_time
+  FROM pc1.machineschedule ms
+  JOIN pc1.facilities      f ON f.id = ms.facility_id
+ WHERE (
+        -- In business hours but availability=0 AND no Hard exception
+        ms.start_time >= f.opening_time
+        AND ms.start_time <  f.closing_time
+        AND ms.availability = 0
+        AND NOT EXISTS (
+            SELECT 1 FROM unnest(ms.exceptions) AS e
+             WHERE e LIKE '% (H)'
+        )
+       )
+    OR (
+        -- Out of business hours but availability=1
+        (ms.start_time <  f.opening_time
+         OR ms.start_time >= f.closing_time)
+        AND ms.availability = 1
+       );
 ```
 
 ---
@@ -337,7 +438,7 @@ SELECT tgname, pg_get_triggerdef(oid)
 -- (Replace the IDs with two real client/facility rows whose
 -- client_ids differ; expect an ERROR, not an INSERT.)
 -- INSERT INTO pc1.machineschedule
---   (client_id, facility_id, modality_id, date_and_time)
+--   (client_id, facility_id, modality_id, date_and_time_utc)
 -- VALUES (1, <facility_id_for_client_2>, <modality_id_for_client_2>, now());
 ```
 
