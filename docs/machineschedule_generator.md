@@ -211,17 +211,26 @@ generator is operator-driven today.
 
 ## Performance
 
-(To be filled in after the verification run on Antioch + Inview-Fremont.)
+Measured on the live Inview Imaging tenant (`client_id = 1`) against
+Supabase, against the May 2026 calendar window (31 days,
+`slot_size = 15`):
 
-| Facility | Modalities | Days | Slot size | Candidate slots | Wall time | Rate |
+| Facility | Modalities | Days | Slot size | Slots inserted | Wall time | Rate |
 |---|---|---|---|---|---|---|
-| Inview-Fremont | ? | 90 | 15 | ? | ? | ? |
-| Antioch        | ? | 90 | 15 | ? | ? | ? |
+| Inview-Fremont          | 8  | 31 | 15 min | 23,808 | 20 s | 1,145 rows/sec |
+| Antioch Medical Imaging | 10 | 31 | 15 min | 29,760 | ~23 s | ~1,290 rows/sec |
+| **Full tenant** (both, fresh-Antioch + idempotent-Fremont) | 18 | 31 | 15 min | 29,760 new + 23,808 skipped | 40 s | 1,328 rows/sec (aggregate) |
 
-Heuristic: 1,000–2,000 rows/sec against Supabase is the expected
-throughput for batched upserts of small records. For a 90-day full
-run on Fremont (say 5 active modalities → 43,200 slots), expect under
-a minute. Larger windows scale linearly.
+Idempotent re-run on a fully-generated Fremont window: 23,808 rows
+attempted, **0 inserted**, 23,808 silently skipped server-side — 17 s
+wall time, which is just the cost of streaming the duplicate rows
+through PostgREST so Postgres can reject them. No UPDATE issued, no
+audit column churn, no row-count drift.
+
+Throughput is consistent with the 1,000–2,000 rows/sec heuristic for
+batched PostgREST inserts of small records. Scales linearly with
+total slot count — a 90-day full-tenant horizon would be ~3× the
+above (≈ 2 min wall time end-to-end).
 
 ---
 
