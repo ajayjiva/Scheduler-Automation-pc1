@@ -4,7 +4,7 @@ The slot calendar. One row per
 `(client_id, facility_id, modality_id, date_and_time_utc)` representing a
 bookable time slot on a single machine. This is the table the
 blank-calendar generator (Phase 2, deferred) populates and the
-exception reconciler (Phase 3, deferred) mutates, and the scheduling
+exception reconciler ([Phase 3](./reconcile_exceptions.md)) mutates, and the scheduling
 engine (Phase 4, deferred) reads when assembling patient appointment
 options.
 
@@ -454,4 +454,6 @@ SELECT tgname, pg_get_triggerdef(oid)
   `source_record_key` values that appear in `exception_ids`, and the
   rule windows the reconciler expands into per-slot overlays.
 - Blank-calendar generator doc — coming with Phase 2.
-- Exception reconciler doc — coming with Phase 3.
+- [`docs/reconcile_exceptions.md`](./reconcile_exceptions.md) —
+  the Phase 3 writer that maintains the `exceptions` / `exception_ids`
+  arrays and the in-hours portion of `availability`.
