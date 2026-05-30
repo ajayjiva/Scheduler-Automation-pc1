@@ -396,4 +396,6 @@ SELECT distinct slot_seq
   `modality_id` rows the generator iterates
 - [`pc1.facilities` doc](./facilities.md) — the source of
   `slot_size` / `timezone` / `advance_booking_days` / `is_client`
-- Exception reconciler doc — coming with Phase 3
+- [`docs/reconcile_exceptions.md`](./reconcile_exceptions.md) — the
+  Phase 3 writer that overlays active `pc1.scheduleexceptions` rules
+  onto these slots

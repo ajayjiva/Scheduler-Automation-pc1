@@ -10,9 +10,9 @@ Each row carries the rule window (`start_date`, `start_time`,
 `end_date`, `end_time`), the recurrence (`recurrence` plus the flat
 day-of-week / day-of-month masks), and the rule's effect on
 availability (`type = 'Hard'` blocks; `'Soft'` is display-only). The
-downstream reconciler (Phase 3, deferred) will iterate active rules
-against `pc1.machineschedule` to drive per-slot `availability` and
-`exceptions[]` updates.
+downstream reconciler ([`reconcile_exceptions.py`](./reconcile_exceptions.md))
+iterates active rules against `pc1.machineschedule` to drive per-slot
+`availability` and `exceptions[]` updates.
 
 Rows are **never hard-deleted** under normal operation. Removals are
 represented by `is_active = false`; the scraper can reactivate them
@@ -119,7 +119,7 @@ DELETE, to take a rule out of rotation.
 
 ## Recurrence semantics
 
-| `recurrence` value | Meaning | Relevant columns | Reconciler behavior (Phase 3, deferred) |
+| `recurrence` value | Meaning | Relevant columns | Reconciler behavior ([`reconcile_exceptions.py`](./reconcile_exceptions.md)) |
 |---|---|---|---|
 | `None`     | One-off rule active only on `start_date`. | `start_date`, `start_time`, `end_time` (and optionally `end_date` if multi-day one-off) | Block slots on that single date in `[start_time, end_time)`. |
 | `Daily`    | Repeats every day in `[start_date, end_date]`. | `weekdays_only` | If `weekdays_only=true`, skip Sat/Sun; else every day. |

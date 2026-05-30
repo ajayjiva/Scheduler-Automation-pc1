@@ -4,7 +4,7 @@ The slot calendar. One row per
 `(client_id, facility_id, modality_id, date_and_time_utc)` representing a
 bookable time slot on a single machine. This is the table the
 blank-calendar generator (Phase 2, deferred) populates and the
-exception reconciler (Phase 3, deferred) mutates, and the scheduling
+exception reconciler ([Phase 3](./reconcile_exceptions.md)) mutates, and the scheduling
 engine (Phase 4, deferred) reads when assembling patient appointment
 options.
 
@@ -234,11 +234,12 @@ the sole maintainer of both arrays. Its contract:
 4. `availability` is `0` when **any** of the following is true:
    (a) any `exceptions` element has marker `H` (Hard), OR
    (b) the slot's `start_time` falls outside the facility's
-       `[opening_time, closing_time)` business-hours window.
-   Otherwise `availability = 1`. The reconciler must preserve the
-   business-hours portion of this invariant — see the generator doc
-   ([Initial availability and business hours](./machineschedule_generator.md#initial-availability-and-business-hours))
-   for the rule.
+       `[opening_time, closing_time)` business-hours window, OR
+   (c) `order_id IS NOT NULL` (the slot is held by an order).
+   Otherwise `availability = 1`. Conditions (a) and (c) are
+   maintained by the reconciler; (b) by the generator. See
+   [`docs/reconcile_exceptions.md` → Availability rule](./reconcile_exceptions.md#availability-rule)
+   for the full rule and how the two writers stay in their lanes.
 
 Postgres can't enforce paired-length or any of the above without a
 trigger. We accept the discipline-enforced contract because the single
@@ -453,4 +454,6 @@ SELECT tgname, pg_get_triggerdef(oid)
   `source_record_key` values that appear in `exception_ids`, and the
   rule windows the reconciler expands into per-slot overlays.
 - Blank-calendar generator doc — coming with Phase 2.
-- Exception reconciler doc — coming with Phase 3.
+- [`docs/reconcile_exceptions.md`](./reconcile_exceptions.md) —
+  the Phase 3 writer that maintains the `exceptions` / `exception_ids`
+  arrays and the in-hours portion of `availability`.
