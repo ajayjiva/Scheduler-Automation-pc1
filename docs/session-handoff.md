@@ -376,7 +376,7 @@ The forward roadmap, in execution order:
 |---|---|---|---|
 | 1 | Port **`pc1.machineschedule`** — the slot calendar | **DONE** — schema migration `0004` (PR #7), generator `generate_machineschedule.py` (PR #8), migration `0005` (column rename to `date_and_time_utc`, seq, business-hours availability), all merged | Generator emits 24-hour grid; `availability=1` in business hours, `0` outside |
 | 2 | Port **`reconcile_exceptions.py`** | **DONE** — `reconcile_exceptions.py` + `docs/reconcile_exceptions.md` merged in PR #9. Reads active `pc1.scheduleexceptions` (modality FK match), overlays onto `pc1.machineschedule`. Availability rule: in-hours slots get `0` if any Hard exception OR `order_id IS NOT NULL`; out-of-hours slots untouched (generator owns them). Booked-slot Hard conflict surfaces a `CONFLICTS` warning + exit code 4 — `order_id` blocker rule lets the Phase 4 booking workflow coexist without write-ordering ceremony | Idempotent re-runs (no DB writes when desired state already matches). Default iterates all `is_client=true` facilities; `--facility=NAME` for one. Parallelism / batching ported verbatim from legacy. Past slots never modified (`range_start = max(--start-date, today)`) |
-| 3.5 | **Stub `pc1.orders` + `pc1.orders_v` compatibility-layer view** | **NEXT TASK** — see §8 | Decouples engine-port work (3.6) from the team's still-in-flight orders-schema decision. The user will provide a draft view definition at the start of the next session. Hand-crafted ~10 test orders (we'll insert patient rows jointly when we get there) |
+| 3.5 | **`pc1.orders_v` compatibility-layer view** (+ plain columns on `pc1.orders` / `pc1.patients`) | **IN PROGRESS** — migrations `0006`–`0009` + `docs/orders.md`/`orders_v.md` on branch `claude/trusting-galileo-B97ad`; test-order seed pending | `pc1.orders` already existed (RIS-shaped) so `0008` ALTERs it (not a stub create). View: multi-row per order, FK columns, `pe_facility_id` for the resolver, tenant+active scoping. `ris_*` (raw) vs plain (internal) column convention. Decouples engine-port work (3.6) from the team's still-evolving orders schema |
 | 3.6 | Port the **scheduling engine** (`main.py` + helpers) | Deferred — depends on (3.5) | Reads from `pc1.orders_v` (the compatibility-layer view from 3.5). Same engine code regardless of the underlying orders table. Legacy reference: `main.py`, `get_orders.py`, `per_machine_resolver.py`, `first_modalitytype_scheduler.py`, `all_modality_scheduler.py`, `next_modalitytype_scheduler.py`, `cumulative_open_slots.py`, `resource_scheduler.py` |
 | 4 | **Real orders schema** (team-driven) | Deferred — design in flux | When the team settles the orders schema, single migration ALTERs `pc1.orders` + replaces `pc1.orders_v`. Engine code from 3.6 keeps working because the view's column contract stays the same. |
 | — | Delete `MODALITY_MAP` + `FACILITY_MODALITIES` from `novaRIS_common.py` | Deferred — marked DEPRECATED in PR #3 | Final consolidation pass |
@@ -413,7 +413,7 @@ in `.env`. Live data as of last refresh (Phase 3 verification + daily-ops run):
 - `pc1.proceduresestimate`: 945 procedures
 - `pc1.scheduleexceptions`: ~16,000 exception rules across the 2 active facilities
 - `pc1.machineschedule`: ~50,000+ slots covering today → today + ~30 days; `exceptions[]` / `exception_ids[]` / `availability` reconciled and current
-- `pc1.orders`: **not yet created** — Phase 3.5 work
+- `pc1.orders`: **already exists** as a RIS-shaped table (`ris_order_id`, `ris_order_status`, `ris_order_type`, `ris_requesting_date`, … + sync quintet). Phase 3.5 ALTERs it to add the plain internal columns the view reads (`procedure_description` + `ris_procedure_description`, `order_status`, `order_type`, `requesting_date`, `preferred_language`, `is_active`) and a cross-tenant trigger. See [`docs/orders.md`](./orders.md). Test orders not yet seeded.
 
 **Active facilities** (`is_client = true` in `pc1.facilities`): Antioch Medical Imaging, Inview-Fremont. The other ~10 facility rows in `pc1.facilities` are inactive contracts retained for historical FK targets.
 
@@ -495,6 +495,12 @@ explicitly said they'd provide it. Once you have it, cross-check
 against this column list and flag any gaps.
 
 ### 8.4 Stub `pc1.orders` shape (proposal — confirm with user)
+
+> **SUPERSEDED during implementation.** `pc1.orders` already existed as a
+> RIS-shaped table, so we did not create a stub — `0008` ALTERs the existing
+> table to add the plain internal columns. The strawman below is kept only as a
+> record of the original plan; see [`docs/orders.md`](./orders.md) for the
+> actual shape.
 
 The view needs an underlying table. Until the team's real schema
 lands, we make a stub:

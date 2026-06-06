@@ -3,9 +3,9 @@
 A **regular (non-materialized) view** that joins [`pc1.orders`](./orders.md),
 `pc1.patients`, and [`pc1.proceduresestimate`](./proceduresestimate.md) into the
 row shape the scheduling engine consumes. It is the **stable contract** between
-the engine (Phase 3.6) and whatever orders table sits underneath — today a stub,
-in Phase 4 the team's real schema. Only the view definition changes across that
-swap; the engine reads the same columns either way.
+the engine (Phase 3.6) and the underlying `pc1.orders` table. As the team
+evolves the orders schema (Phase 4), the view definition absorbs the change so
+the engine keeps reading the same columns either way.
 
 > **Why a view, not inline joins.** Postgres rewrites a regular view at query
 > time, so performance equals hand-written joins **as long as** we avoid
@@ -52,7 +52,7 @@ engine bundle.
 | `preferred_language` | `orders.preferred_language` | display / routing |
 | `order_status` | `orders.order_status` | internal (vocabulary TBD) |
 | `order_type` | `orders.order_type` | internal ('P'/'S' TBD) |
-| `requesting_date` | `orders.requesting_date` | internal |
+| `requesting_date` | `orders.requesting_date` | facility-local date; 3.6 engine pins the search start-floor to it when set |
 | `procedure_description` | `orders.procedure_description` | display + the catalog join key |
 | `procedure_code` | `proceduresestimate.procedure_code` (text[]) | display / safety-net (not consumed by current logic) |
 | `pe_facility_id` | `proceduresestimate.facility_id` | the **procedure's** facility; resolver per-facility tier |
@@ -139,7 +139,7 @@ inserted (see the seed migration).
 
 ## Related
 
-- [`pc1.orders`](./orders.md) — underlying stub table
+- [`pc1.orders`](./orders.md) — the underlying orders table
 - [`pc1.proceduresestimate`](./proceduresestimate.md) — catalog (4-shape override design)
 - [`pc1.machineschedule`](./machineschedule.md) — slot calendar the engine schedules into
 - `docs/session-handoff.md` §8 — full Phase 3.5 design context + decisions

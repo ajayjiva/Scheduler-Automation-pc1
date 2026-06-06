@@ -1,4 +1,4 @@
-# `pc1.orders` (STUB — Phase 3.5)
+# `pc1.orders`
 
 The patient-order table. One row per ordered procedure for a patient at a
 facility. Orders are the top-level input to the scheduling engine: the engine
@@ -6,61 +6,79 @@ pulls a patient's orders, expands each against the procedure catalog
 (`pc1.proceduresestimate`) through the [`pc1.orders_v`](./orders_v.md) view, and
 computes appointment options.
 
-> **This is a deliberate stub.** The team's real orders schema is still in
-> design (Phase 4). To unblock the scheduling-engine port (Phase 3.6) we ship a
-> minimal table carrying only the columns `pc1.orders_v` needs, plus
-> hand-crafted test data. When the real schema lands it **replaces** this table;
-> `pc1.orders_v`'s column contract stays stable so the engine code is
-> unaffected. See `docs/session-handoff.md` §8.
+`pc1.orders` is a **RIS-shaped table** (like `pc1.patients`): most business
+fields arrive raw from the source RIS under a `ris_*` prefix
+(`ris_order_id`, `ris_order_status`, `ris_order_type`, `ris_requesting_date`,
+`ris_billing_type`, insurance/accident/location fields, …) plus the standard
+`ris_system` / `ris_sync_status` / `ris_last_synced_at` / `ris_metadata` sync
+quintet and audit columns.
+
+> **History.** The table pre-existed the Phase 3.5 work (the old session-handoff
+> snapshot that said "`pc1.orders`: not yet created" was stale). Phase 3.5 does
+> **not** create it — it ADDs the plain internal columns the view needs
+> (`migrations/0008_alter_pc1_orders_internal_columns.sql`).
 
 ---
 
 ## Design notes (the "why")
 
-### `cpt_codes` is eliminated
-The legacy system carried a `cpt_codes` lookup table mapping order text to CPT
-codes. **pc1 drops it.** Orders link straight to the procedure catalog by
-description:
-
-```
-orders.procedure_description  =  proceduresestimate.procedure_desc   (exact text)
-```
-
-`procedure_code` (the CPT array) is then sourced **from the catalog** via the
-view, not stored on the order. The `studies` table is likewise **not used** for
-scheduling.
-
-> **Exact-match contract.** `procedure_description` must match
-> `proceduresestimate.procedure_desc` character-for-character. Drift (a typo, a
-> trailing space, a renamed procedure) means the join finds nothing and the
-> order silently drops out of `orders_v`. This is the same naming-exactness
-> discipline as `pc1.facilities` ↔ NovaRIS facility names. Keep order text in
-> lockstep with the catalog.
-
 ### `ris_*` vs plain columns
-A convention used across pc1 (introduced on `pc1.patients`, applied here):
+The convention used across pc1 (`pc1.patients`, and here):
 
 | Prefix | Holds | Written by |
 |---|---|---|
 | `ris_*` | RAW value, exactly as it came from the source RIS | the RIS scraper |
 | plain (un-prefixed) | the value used by INTERNAL logic (engine, views) | starts as a copy of the `ris_*` value; later may carry cleanup/normalization |
 
-The split lets us normalize (name casing, language-code mapping, status
-canonicalization, …) into the plain column **without mutating the
-source-of-truth `ris_*` value**. The stub only creates the plain business
-columns the view reads; the real Phase 4 schema will add the `ris_*`
-counterparts (`ris_order_status`, `ris_order_type`, `ris_requesting_date`).
+The split lets us normalize (status canonicalization, language-code mapping, …)
+into the plain column **without mutating the source-of-truth `ris_*` value**.
+Phase 3.5 adds these plain columns and backfills them from their raw sources:
 
-> **Staleness dependency.** Once a real orders scraper writes `ris_*`, it (or a
-> trigger) must also refresh the plain columns, or they go stale. Same caveat
-> applies to the new plain columns on `pc1.patients` (see
-> `migrations/0006_add_patients_internal_columns.sql`).
+| Plain column | Raw source |
+|---|---|
+| `order_status` | `ris_order_status` |
+| `order_type` | `ris_order_type` |
+| `requesting_date` | `ris_requesting_date` |
+| `procedure_description` | `ris_procedure_description` (also added — see below) |
+| `preferred_language` | *(internal-only; no RIS source)* |
+| `is_active` | *(internal soft-delete; no RIS source)* |
+
+> **Staleness dependency.** When the orders RIS scraper refreshes the `ris_*`
+> columns, it (or a trigger) must also refresh these plain columns, or they go
+> stale. Same caveat as the plain columns on `pc1.patients`.
+
+### `cpt_codes` is eliminated; no procedure column existed
+The legacy system carried a `cpt_codes` lookup table. **pc1 drops it**, and the
+`studies` table is **not used** for scheduling. Orders link straight to the
+catalog by description:
+
+```
+orders.procedure_description  =  proceduresestimate.procedure_desc   (exact text)
+```
+
+`pc1.orders` carried **no procedure column at all**, so Phase 3.5 adds both
+`ris_procedure_description` (raw) and `procedure_description` (the plain join
+key). `procedure_code` (the CPT array) is sourced **from the catalog** via the
+view, never stored on the order.
+
+> **Exact-match contract.** `procedure_description` must match
+> `proceduresestimate.procedure_desc` character-for-character. Drift (a typo, a
+> trailing space, a renamed procedure) means the join finds nothing and the
+> order silently drops out of `orders_v` — the same naming-exactness discipline
+> as `pc1.facilities` ↔ NovaRIS facility names.
+
+### `requesting_date` — facility-local date, future engine use
+`requesting_date` is a facility-**local** `date` (not a timestamp — time-of-day
+isn't meaningful). It's not consumed by the current logic, but the Phase 3.6
+engine will use it as an override: when an order carries a `requesting_date`
+(e.g. "the requesting date is ~15 days out"), the scheduler pins its search
+**start-floor to that local date** instead of starting from "now", so options
+are produced only for that day forward rather than the whole rolling horizon.
 
 ### Open question — `order_type` 'P' / 'S'
 NovaRIS appears to emit an order type of `P` or `S`. **The meaning is
-unconfirmed.** Until it's pinned, `order_type` has **no CHECK constraint**. Add
-one (and document the vocabulary) once confirmed. `order_status` is likewise
-TBD / un-constrained.
+unconfirmed**, so `order_type` (and `order_status`, whose vocabulary is also
+TBD) carry **no CHECK constraint**. Add one once the vocabulary is confirmed.
 
 ---
 
@@ -70,52 +88,55 @@ TBD / un-constrained.
 |---------------|---------------------|
 | Surrogate PK  | `id`                |
 | Tenant scope  | `client_id`         |
-| FK targets    | `facility_id` → `pc1.facilities`, `patient_id` → `pc1.patients` |
+| RIS-side id   | `ris_order_id` (NOT NULL) |
+| FK targets    | `facility_id` → `pc1.facilities` (nullable), `patient_id` → `pc1.patients` |
 
-No `source_record_key` / `content_hash` / `ris_*` sync quintet on the stub —
-orders aren't scraped yet. Those arrive with the Phase 4 schema.
+## Columns added by Phase 3.5
 
-## Columns
+The full RIS column set is documented at the source; these are the columns
+Phase 3.5 adds (all NULL-able except `is_active`):
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | `bigserial` PK | |
-| `client_id` | `bigint NOT NULL` | FK `pc1.clients`. No DEFAULT (multi-tenant footgun) |
-| `facility_id` | `bigint NOT NULL` | FK `pc1.facilities`. The order's facility |
-| `patient_id` | `bigint NOT NULL` | FK `pc1.patients` |
-| `procedure_description` | `text NOT NULL` | Exact-match join key to `proceduresestimate.procedure_desc` |
-| `preferred_language` | `varchar(50) NULL` | Plain/internal |
-| `order_status` | `varchar(50) NULL` | Plain/internal. Vocabulary TBD — no CHECK |
-| `order_type` | `varchar(20) NULL` | Plain/internal. NovaRIS 'P'/'S', meaning TBD — no CHECK |
-| `requesting_date` | `date NULL` | Date the order was requested. Widen to `timestamptz` if the RIS carries a time |
-| `is_active` | `boolean NOT NULL DEFAULT true` | Soft-delete |
-| `created_at` / `updated_at` | `timestamptz NOT NULL DEFAULT now()` | Audit |
-| `created_by` / `updated_by` | `bigint NULL` | FK `pc1.user_profiles ON DELETE SET NULL` |
+| `ris_procedure_description` | `text` | Raw procedure text from the RIS |
+| `procedure_description` | `text` | Plain join key → `proceduresestimate.procedure_desc` |
+| `preferred_language` | `varchar(50)` | Internal-only |
+| `order_status` | `varchar(50)` | Plain ← `ris_order_status`. Vocabulary TBD — no CHECK |
+| `order_type` | `varchar(20)` | Plain ← `ris_order_type`. 'P'/'S' TBD — no CHECK |
+| `requesting_date` | `date` | Plain ← `ris_requesting_date`. Facility-local; future start-floor override |
+| `is_active` | `boolean NOT NULL DEFAULT true` | Soft-delete; the view filters on it |
 
 ## Cross-tenant safety trigger
 
-`pc1.check_orders_consistency()` fires `BEFORE INSERT OR UPDATE OF client_id,
-facility_id, patient_id`. It validates that `client_id` matches both the FK'd
-**facility's** and the FK'd **patient's** `client_id`, turning a cross-tenant
-mis-link into a loud INSERT failure. Matches the trigger pattern on
-`pc1.proceduresestimate` / `pc1.scheduleexceptions`.
+Phase 3.5 also adds `pc1.check_orders_consistency()` (absent before), firing
+`BEFORE INSERT OR UPDATE OF client_id, facility_id, patient_id`. It validates
+that `client_id` matches both the FK'd **facility's** and the FK'd **patient's**
+`client_id`, turning a cross-tenant mis-link into a loud INSERT failure. Matches
+the trigger pattern on `pc1.proceduresestimate` / `pc1.scheduleexceptions`.
+`facility_id` is nullable, so the facility check short-circuits when it's NULL.
 
 ## Verification queries (post-migration)
 
 ```sql
--- table exists with the expected columns
+-- the new plain columns exist
 SELECT column_name, data_type, is_nullable
 FROM information_schema.columns
 WHERE table_schema = 'pc1' AND table_name = 'orders'
-ORDER BY ordinal_position;
+  AND column_name IN ('ris_procedure_description','procedure_description',
+                      'preferred_language','order_status','order_type',
+                      'requesting_date','is_active')
+ORDER BY column_name;
+
+-- plain columns backfilled from their ris_* sources (expect 0 mismatched rows)
+SELECT count(*) AS mismatched
+FROM pc1.orders
+WHERE order_status    IS DISTINCT FROM ris_order_status
+   OR order_type      IS DISTINCT FROM ris_order_type
+   OR requesting_date IS DISTINCT FROM ris_requesting_date;
 
 -- trigger present
 SELECT tgname FROM pg_trigger
 WHERE tgrelid = 'pc1.orders'::regclass AND NOT tgisinternal;
-
--- cross-tenant guard works (should RAISE):
---   INSERT INTO pc1.orders (client_id, facility_id, patient_id, procedure_description)
---   VALUES (1, <facility_of_other_client>, <patient_of_client_1>, 'X');
 ```
 
 ## Related
