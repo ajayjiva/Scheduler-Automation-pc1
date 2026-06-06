@@ -376,19 +376,21 @@ The forward roadmap, in execution order:
 |---|---|---|---|
 | 1 | Port **`pc1.machineschedule`** — the slot calendar | **DONE** — schema migration `0004` (PR #7), generator `generate_machineschedule.py` (PR #8), migration `0005` (column rename to `date_and_time_utc`, seq, business-hours availability), all merged | Generator emits 24-hour grid; `availability=1` in business hours, `0` outside |
 | 2 | Port **`reconcile_exceptions.py`** | **DONE** — `reconcile_exceptions.py` + `docs/reconcile_exceptions.md` merged in PR #9. Reads active `pc1.scheduleexceptions` (modality FK match), overlays onto `pc1.machineschedule`. Availability rule: in-hours slots get `0` if any Hard exception OR `order_id IS NOT NULL`; out-of-hours slots untouched (generator owns them). Booked-slot Hard conflict surfaces a `CONFLICTS` warning + exit code 4 — `order_id` blocker rule lets the Phase 4 booking workflow coexist without write-ordering ceremony | Idempotent re-runs (no DB writes when desired state already matches). Default iterates all `is_client=true` facilities; `--facility=NAME` for one. Parallelism / batching ported verbatim from legacy. Past slots never modified (`range_start = max(--start-date, today)`) |
-| 3 | Scrape **patient orders** into `pc1.orders` | Deferred — needed to drive the scheduling engine | Source page in NovaRIS TBD (likely `Orders.aspx` or similar). May or may not need a two-pass scrape. New table; two-phase PR pattern applies |
-| 4 | Port scheduling engine (patient-options builder) | Deferred — depends on (1), (2), (3) | Core business logic; legacy `main.py`. Compute appointment options for patients with multiple orders across multiple modalities |
+| 3.5 | **Stub `pc1.orders` + `pc1.orders_v` compatibility-layer view** | **NEXT TASK** — see §8 | Decouples engine-port work (3.6) from the team's still-in-flight orders-schema decision. The user will provide a draft view definition at the start of the next session. Hand-crafted ~10 test orders (we'll insert patient rows jointly when we get there) |
+| 3.6 | Port the **scheduling engine** (`main.py` + helpers) | Deferred — depends on (3.5) | Reads from `pc1.orders_v` (the compatibility-layer view from 3.5). Same engine code regardless of the underlying orders table. Legacy reference: `main.py`, `get_orders.py`, `per_machine_resolver.py`, `first_modalitytype_scheduler.py`, `all_modality_scheduler.py`, `next_modalitytype_scheduler.py`, `cumulative_open_slots.py`, `resource_scheduler.py` |
+| 4 | **Real orders schema** (team-driven) | Deferred — design in flux | When the team settles the orders schema, single migration ALTERs `pc1.orders` + replaces `pc1.orders_v`. Engine code from 3.6 keeps working because the view's column contract stays the same. |
 | — | Delete `MODALITY_MAP` + `FACILITY_MODALITIES` from `novaRIS_common.py` | Deferred — marked DEPRECATED in PR #3 | Final consolidation pass |
 | — | `pc1.user_profiles` lifecycle | Open question | Referenced by every audit FK but how does a row get into it? Login UI? Manual SQL? |
 
 ## 7. Project Today (snapshot)
 
 **Tables in pc1 schema**:
-- `pc1.clients` — tenant identity + global per-tenant defaults (`slot_size`, etc.)
-- `pc1.facilities` — per-tenant facility list with `is_client` gate and per-facility overrides
+- `pc1.clients` — tenant identity + global per-tenant defaults (`slot_size`, `opening_time` / `closing_time`, `advance_booking_days`, `timezone`, etc.)
+- `pc1.facilities` — per-tenant facility list with `is_client` gate and per-facility overrides (all the same parameter columns)
 - `pc1.modalities` — per-facility machine inventory, populated by `novaRIS_modalities_scraper.py`
 - `pc1.proceduresestimate` — procedure catalog with 4-shape override design, populated by `novaRIS_standardprocedure_scraper.py`
 - `pc1.scheduleexceptions` — scheduling-exception rules with flat recurrence-mask columns, populated by `novaRIS_exception_scraper.py`
+- **`pc1.machineschedule` — slot calendar.** Generator-produced (not RIS-sourced); UTC `date_and_time_utc`; facility-local `start_time`/`end_time`/`seq` (the `YYYYMMDDHHMMSS` engine-contract integer); paired `exceptions[]` / `exception_ids[]` arrays; `order_id` column present with FK to `pc1.orders` **deferred** to Phase 4. See [`docs/machineschedule.md`](./machineschedule.md).
 - `pc1.user_profiles` — referenced by audit FKs (lifecycle TBD)
 
 **Working scrapers**:
@@ -396,133 +398,211 @@ The forward roadmap, in execution order:
 - `novaRIS_standardprocedure_scraper.py` — per-modality iteration, two-pass scrape (grid → wizard), parallel detail fetches, ~20-min full run for ~945 procedures
 - `novaRIS_exception_scraper.py` — per-facility iteration, two-pass scrape (grid → popup, popup only for recurring rules), plain full-page postbacks, ~2 min/facility for ~8K rows
 
+**Working calendar writers** (Phase 1–3 outputs):
+- `generate_machineschedule.py` — blank-slot generator. Default iterates `is_client=true` facilities. 24-hour grid; `availability=1` in business hours, `0` outside. ON CONFLICT DO NOTHING idempotency. ~1,300 rows/sec.
+- `reconcile_exceptions.py` — exception overlay writer. Default iterates `is_client=true` facilities. In-hours `availability=0` when any Hard exception OR `order_id IS NOT NULL`; out-of-hours untouched. CONFLICTS warning + exit code 4 for booked-vs-Hard. ~14 s idempotent re-run per facility.
+
 **Shared infrastructure**:
 - `supabase_client.py` — `get_supabase()` factory (12 lines)
 - `client_context.py` — `resolve_client_id()` and `add_client_id_arg()` CLI helper (the `get_param`/`get_client_parameters` functions are legacy — read from a `clientparameters` table that doesn't exist in pc1; do NOT use them)
 - `novaRIS_common.py` — `login()`, `make_session()`, form/HTML helpers, env-driven `BASE_URL`/`USERNAME`/`PASSWORD`
 
 **Test tenant**: `client_id = 1` (Inview Imaging). Real NovaRIS account
-in `.env`. Production data as of session ship:
-- `pc1.modalities`: ~scraped modalities across 2 active facilities
+in `.env`. Live data as of last refresh (Phase 3 verification + daily-ops run):
+- `pc1.modalities`: scraped modalities across the 2 active facilities (Antioch + Inview-Fremont)
 - `pc1.proceduresestimate`: 945 procedures
-- `pc1.scheduleexceptions`: 16,063 exception rules across 2 facilities (Antioch 7,990 / Inview-Fremont 8,073)
+- `pc1.scheduleexceptions`: ~16,000 exception rules across the 2 active facilities
+- `pc1.machineschedule`: ~50,000+ slots covering today → today + ~30 days; `exceptions[]` / `exception_ids[]` / `availability` reconciled and current
+- `pc1.orders`: **not yet created** — Phase 3.5 work
 
 **Active facilities** (`is_client = true` in `pc1.facilities`): Antioch Medical Imaging, Inview-Fremont. The other ~10 facility rows in `pc1.facilities` are inactive contracts retained for historical FK targets.
 
-## 8. Next task: `pc1.machineschedule`
+**Routine daily-ops command sequence** (operator-driven; no cron):
+```powershell
+python novaRIS_exception_scraper.py            # delta refresh from NovaRIS
+python generate_machineschedule.py --days-ahead=30   # extend rolling horizon
+python reconcile_exceptions.py --days-ahead=30       # overlay current exceptions
+```
 
-The slot calendar. One row per `(client_id, facility_id, modality_id,
-date_and_time)` representing a bookable time slot. The scheduling
-engine fills these with orders; the reconciler (next-after-this
-deferred item) blocks them based on `pc1.scheduleexceptions`.
+## 8. Next task: orders compatibility layer (Phase 3.5)
 
-### 8.1 Legacy reference (for context only — do NOT port verbatim)
+The team is **still designing the orders table schema** and won't
+land it for a while. To stay on schedule, we're decoupling the
+engine port (3.6) from the orders schema decision (Phase 4) by
+introducing a `pc1.orders_v` view as a **compatibility layer**.
 
-The legacy `machineschedule` table carried at minimum:
+Strategy: define a stable column contract on `pc1.orders_v` now,
+back it with a stub `pc1.orders` table + hand-crafted test data,
+port the engine against the view. When the team finalizes the real
+orders schema, only the view definition changes. Engine code stays
+identical.
 
-- `client_id`, `facility` (text), `modality_machine` (text) → become `facility_id`, `modality_id` FKs in pc1
-- `date_and_time` — UTC timestamptz (legacy migrated from facility-local to UTC; pc1 should match)
-- `availability` — integer (0 = blocked, 1 = free; the reconciler updates this)
-- `exceptions` — `text[]` — display labels like `'LUNCH (H)'`, `'HOLIDAY (S)'`
-- `exception_ids` — `text[]` — paired positionally with `exceptions`; each element is a `source_record_key` from `pc1.scheduleexceptions`
-- `order_id` / `slot_status` / etc. — for engine-side bookkeeping; scope TBD
-- Audit columns (legacy names — **rename in pc1**)
+### 8.1 Why a view, not direct table reads
 
-Legacy script: `create_blank_calendar.py` (a generator, not a
-scraper — calendar slots are not RIS-derived). Pattern: walk every
-active modality, walk every date in the rolling window, walk every
-slot in the working day, INSERT.
+Postgres regular VIEWs are query-rewrite rules — there is **no
+performance overhead** vs writing the joins inline as long as:
+- The view doesn't use `DISTINCT ON` or aggregations
+- Underlying join columns are indexed
+- The view exposes columns the planner can push WHERE clauses
+  against
 
-### 8.2 Expected workflow (two-phase, same as previous tables)
+A 4–5-join view of `orders` + `proceduresestimate` + `facilities` +
+`modalities` runs the same plan as if `main.py` wrote the joins
+itself. The user explicitly asked about this — the discussion is
+in the session that produced this handoff. Short answer:
+**non-materialized view, performance is comparable to direct joins.**
 
-**Phase 1**: schema migration + docs
-- New migration: `migrations/0004_create_pc1_machineschedule.sql`
-- New doc: `docs/machineschedule.md` (schema reference, slot-arithmetic
-  semantics, time-zone handling, common queries, verification queries)
-- PR scope: migration + doc only
-- Verification: SQL queries in Supabase confirming table shape,
-  constraints, indexes, and trigger before merge
+The user wants this guarantee maintained — don't switch to
+MATERIALIZED VIEW or function-based views without re-discussing.
 
-**Phase 2**: blank-slot generator + docs
-- New script: `create_blank_calendar.py` (or rename for pc1
-  consistency — `generate_machineschedule.py` is the leading
-  candidate)
-- New doc: `docs/machineschedule_generator.md` (or similar)
-- PR scope: script + doc
-- Verification: end-to-end run for a single facility, sanity SQL
-  on the generated rows (one row per slot × machine × day; no
-  duplicates; correct time zone)
+### 8.2 Design decisions already locked in
 
-### 8.3 Things to ask the user before starting Phase 1
+These were agreed during the session that produced this handoff.
+Don't re-litigate; just implement.
 
-Don't design the schema in isolation — confirm these first:
+| # | Decision | Rationale |
+|---|---|---|
+| 1 | **Sub-phase split**: 3.5 (orders compat layer) → 3.6 (engine port reading the view) → Phase 4 (team's real orders schema replaces the underlying tables; view contract stays) | Decouples work; engine port is testable without real orders |
+| 2 | **`pc1.orders_v` returns multiple rows per order** — one row per matching `pc1.proceduresestimate` entry (no `DISTINCT ON`). Precedence resolved in Python by `per_machine_resolver.py`. Matches the final legacy shape (`orders_v_per_machine_rows.sql`) | Engine needs per-machine candidate rows; per_machine_resolver expects multi-row input |
+| 3 | **FK columns over text names** for facility / modality joins. Expose `facility_id`, `modality_id` instead of legacy `facility` / `module` text. Engine port will use FK joins. | pc1's FK convention; avoids text-spelling drift |
+| 4 | **Keep `procedure_description` (text)** in the view. The scraper brings descriptions over, not IDs — display layer wants the text. | User-requested |
+| 5 | **Defer `stat_order`, `machine_skill`, `contrast_skill`** for now. Not used in the current scheduling logic. Add columns to the view when the engine logic that needs them lands. | User-requested — don't pay for unused contract surface |
+| 6 | **Test data is hand-crafted ~10 patients**, inserted directly into `pc1.orders` (single-modality, multi-modality, per-facility override, per-machine override, multi-CPT). **Patient rows insert jointly** — there isn't a `pc1.patients` table yet; we'll create whatever's needed when the engine port starts | User-requested; lets engine port proceed without real patient data |
+| 7 | **The user will provide draft view DDL** at the start of the next session. Don't draft it yourself — they have a specific shape in mind | Captured from user directly |
 
-1. **`date_and_time` storage**: UTC (matching legacy post-migration)
-   or facility-local? UTC is the standard pc1 convention; recommend UTC
-2. **Working-hours source**: where does "this machine is open
-   8am-6pm Mon-Fri" live? Options:
-   - Inspect existing `pc1.facilities` + `pc1.modalities` schemas
-     for unused columns
-   - Add new columns to `pc1.modalities` (or a new
-     `pc1.modality_hours` table) for per-machine schedules
-   - Use a single per-tenant working-day default
-3. **Time zone**: needs to be per-facility (Inview-Fremont is
-   America/Los_Angeles; future tenants may span TZs). Inspect
-   `pc1.facilities` for an existing `timezone` column; add one if
-   missing
-4. **Slot size resolution**: confirmed in §4.4 — `pc1.clients.slot_size`
-   default + `pc1.facilities.slot_size` override. Generator computes
-   `required_slots = ceil(slot_window / slot_size)`. **Verify both
-   columns exist** (they're referenced in earlier docs but I haven't
-   independently confirmed they're in the current pc1.clients /
-   pc1.facilities schema)
-5. **Rolling window strategy**:
-   - How far ahead to pre-generate? 30 days? 90 days? Per-tenant config?
-   - Cadence: nightly cron to extend (matches legacy) or on-demand?
-   - For pc1's on-demand-first philosophy, recommend on-demand with
-     a `--days-ahead=N` flag; the operator runs it weekly
-6. **`exceptions` / `exception_ids` columns**: keep as `text[]`
-   (legacy) or switch to a JSONB array of `{key, label}` objects?
-   The legacy reconciler reads both as paired arrays — keep `text[]`
-   to avoid rewriting the reconciler. CHECK constraint that they
-   have equal length is impossible in Postgres without a trigger;
-   accept the discipline-enforced positional pairing
-7. **Initial `availability`**: hardcode `1` (free) at generation
-   time? The reconciler will flip Hard-exception slots to `0`
-   on its first run. Recommend yes
-8. **Idempotency**: re-running the generator for an already-generated
-   window should be a no-op (or extend the window only). Use an
-   ON CONFLICT clause against `(client_id, facility_id, modality_id,
-   date_and_time)` to skip duplicates
-9. **Cross-tenant trigger**: yes — same pattern as
-   `pc1.proceduresestimate` / `pc1.scheduleexceptions`. Validates
-   `client_id` matches `facility_id`'s and `modality_id`'s tenant
-10. **Order-side columns** (`order_id`, `slot_status`, etc.): in
-    scope for this phase, or defer until Phase 3 (`pc1.orders`)?
-    Recommend defer — generate the calendar with just the
-    reconciler-relevant columns (availability + exceptions arrays)
-    and add order-side columns when the orders work lands
+### 8.3 Where the engine-side column requirements come from
 
-### 8.4 Things to consider for Phase 2 (the generator)
+The legacy main.py + helpers expect these columns on each `orders_v`
+row (from the 3,025-line bundle reviewed during Phase 3 design):
 
-- **Idempotent re-runs**: ON CONFLICT DO NOTHING is the cheapest
-  win; lets operators re-run the generator without thinking about
-  state
-- **Time-zone math**: store UTC but iterate facility-local. The
-  `working_hours = 08:00-18:00` is facility-local; the generated
-  `date_and_time` is `(facility-local 08:00).astimezone(UTC)`. Zoneinfo
-  handles DST automatically when used correctly
-- **Batch INSERT**: probably groups of 1000-5000 for fast loads
-  (one machine × 90 days × 16-hour day × 4 slots/hour = 5,760 rows;
-  small enough to bulk-insert per machine)
-- **Don't depend on `pc1.scheduleexceptions`** during generation —
-  blank slots are blank by definition. The reconciler is the only
-  thing that touches `availability`
-- **CLI flags**: `--facility`, `--modality`, `--days-ahead`,
-  `--start-date` (default today), `--dry-run`, `--client-id`,
-  `--quiet`. Use existing add_client_id_arg helper
-- **"Measured performance" section** in the doc with actual numbers
-  from the verification run (precedent set in PR #5)
+| Column | Source (in legacy) | Used by |
+|---|---|---|
+| `order_id` | `orders.id` | dedup, conflict reporting in `per_machine_resolver.py` |
+| `client_id` | `orders.client_id` | tenant scope filter |
+| `patient_id` | `orders.patient_id` | top-level engine input filter |
+| `facility_id` ← (pc1 change from legacy `facility` text) | `orders.facility_id` | matching against pe rows in `per_machine_resolver._row_tier()` |
+| `modality_id` ← (pc1 change from legacy `module` text) | `proceduresestimate.modality_id` | per-machine override resolution |
+| `pe_facility_id` ← (pc1 change from legacy `pe_facility` text) | `proceduresestimate.facility_id` | per-facility override resolution |
+| `procedure_code` | `proceduresestimate.procedure_code[]` | order-to-procedure JOIN: `o.procedure_code = ANY(pe.procedure_code)` |
+| `procedure_description` | `proceduresestimate.procedure_desc` | display + transitional safety-net JOIN |
+| `required_slots` | `proceduresestimate.required_slots` | scheduler block sizing |
+| `modality_type` | `proceduresestimate.modality_type` | engine modality grouping |
+| **DEFERRED:** `stat_order`, `machine_skill`, `contrast_skill` | n/a yet | Add when engine logic uses them |
+
+When you start the next session, **the very first thing** is to
+ask the user for the view DDL they had in mind. Don't infer — they
+explicitly said they'd provide it. Once you have it, cross-check
+against this column list and flag any gaps.
+
+### 8.4 Stub `pc1.orders` shape (proposal — confirm with user)
+
+The view needs an underlying table. Until the team's real schema
+lands, we make a stub:
+
+```sql
+-- Stub. Minimal columns to support orders_v. Will be replaced when
+-- the team's real orders schema lands; orders_v's contract stays.
+CREATE TABLE pc1.orders (
+    id                bigserial    PRIMARY KEY,
+    client_id         bigint       NOT NULL REFERENCES pc1.clients(id),
+    patient_id        bigint       NOT NULL,
+    facility_id       bigint       NOT NULL REFERENCES pc1.facilities(id),
+    procedure_code    text         NOT NULL,        -- single CPT; view does the array containment
+    procedure_description text     NULL,            -- denormalized for the engine display
+    is_active         boolean      NOT NULL DEFAULT true,
+    created_at        timestamptz  NOT NULL DEFAULT now(),
+    updated_at        timestamptz  NOT NULL DEFAULT now(),
+    created_by        bigint       NULL REFERENCES pc1.user_profiles(id) ON DELETE SET NULL,
+    updated_by        bigint       NULL REFERENCES pc1.user_profiles(id) ON DELETE SET NULL
+    -- Cross-tenant trigger on client_id / facility_id (matches sibling tables)
+);
+```
+
+This is a **strawman** — the next session should confirm with the
+user before applying. The view definition (user-provided) will tell
+us if any additional source columns are required.
+
+### 8.5 What the next session should NOT do
+
+- Don't try to anticipate the team's real orders schema. They're
+  still discussing. Whatever we build for 3.5 is **explicitly stub**.
+- Don't add columns to `orders_v` for `stat_order` / `machine_skill`
+  / `contrast_skill`. User explicitly deferred them.
+- Don't `DISTINCT ON` collapse the view. Multi-row shape.
+- Don't bake the FK to `pc1.orders` on `pc1.machineschedule.order_id`
+  yet — that's part of the real Phase 4. The column exists, the FK
+  constraint is deferred.
+- Don't propose a MATERIALIZED VIEW or function-based view. Regular
+  VIEW only.
+
+### 8.6 Suggested work order for Phase 3.5
+
+1. **Start the session by asking** the user for the `orders_v` DDL
+   they have in mind. Read it.
+2. **Inventory main.py / get_orders.py / per_machine_resolver.py**
+   for every `orders_v` row column reference. Compare against the
+   user's DDL. Flag any gaps.
+3. **Draft the stub `pc1.orders` table migration** that supports
+   the user's view. Use the §8.4 strawman as starting point; adjust
+   based on their view's required source columns.
+4. **Draft the `pc1.orders_v` migration** (CREATE VIEW). User's DDL
+   is the input; we just package it as a numbered migration with
+   an `orders_v_compat_layer` doc.
+5. **Draft `docs/orders.md` + `docs/orders_v.md`** — schema docs
+   following the existing conventions. Explicitly mark both as
+   "stub for Phase 3.5; will be replaced when Phase 4 lands."
+6. **Hand-craft test data** — ~10 patient orders covering the
+   scenarios in §8.2 decision #6. Insert via a separate
+   `migrations/000X_seed_test_orders.sql` (NOT part of the prod
+   migration sequence; clearly labeled).
+7. **Verification:** SQL queries that exercise the view from each
+   covered shape. Document expected row counts per patient.
+8. **PR.** Schema + docs + seed data in one PR. Step-by-step
+   verification + merge pattern same as PRs #7, #8, #9.
+
+Phase 3.6 (engine port) is a separate PR. Even larger surface; do
+NOT bundle.
+
+### 8.7 Legacy reference files (in the 3,025-line bundle)
+
+Read these to inform the column contract and engine behavior:
+
+| Legacy file | Why it matters |
+|---|---|
+| `main.py` | Top-level: pulls orders via `get_summary_list()`, builds combination matrix, calls scheduler, prints options |
+| `get_orders.py` | Wraps the `orders_v` SELECT, returns `(summary_list, rows, facility)` tuple |
+| `per_machine_resolver.py` | The 4-tier precedence logic (`facility,machine` → `facility,NULL` → `NULL,machine` → `NULL,NULL`). Pure functions; readable |
+| `first_modalitytype_scheduler.py` | Computes eligible anchor-block slot rows; reads `calc_cumm_below`, `availability`, `modality_machine` |
+| `all_modality_scheduler.py` | Builds full chains; key contract: `str(seq)[:8]` = facility-local YYYYMMDD. **pc1 honors this** — see [`docs/machineschedule.md` → seq engine contract](./machineschedule.md#the-seq-engine-contract) |
+| `next_modalitytype_scheduler.py` | Adjacent-block search; same seq[:8] contract |
+| `cumulative_open_slots.py` | Walks consecutive availability=1 rows; group-by `(modality_machine, facility-local-date)` |
+| `resource_scheduler.py` | Resource availability check; honored only when tenant has `use_technician_calendar=true` (Inview Imaging has it false; pc1's `use_technician_calendar` column exists on both clients + facilities) |
+| `option_filters.py` | Dedup + Pareto-prune on the option output |
+| `tz_helpers.py` | `resolve_facility_tz(cp)`, `slot_local_dt(row, facility_tz)`, etc. Reconciler ported the helpers inline — see `reconcile_exceptions.py` for the pattern |
+
+The bundle's main.py uses an old `clientparameters` table that
+**does not exist in pc1**. Read `client_context.py` in the current
+repo for what to use instead (read directly from `pc1.clients` and
+`pc1.facilities`).
+
+### 8.8 Critical contract pc1 already honors
+
+The Phase 1-3 work in pc1 set up two key invariants the engine
+relies on. Don't break them:
+
+1. **`pc1.machineschedule.seq` = facility-local YYYYMMDDHHMMSS
+   bigint**. Engine extracts the local date via `str(seq)[:8]`.
+   Documented in [`docs/machineschedule.md` → seq engine contract](./machineschedule.md#the-seq-engine-contract).
+2. **`pc1.machineschedule.start_time` / `end_time` are facility-
+   local clock times.** Engine displays them directly to patients
+   without UTC conversion. `date_and_time_utc` is the UTC instant
+   for query filtering; `start_time` is the local human-facing time.
+3. **`pc1.machineschedule.availability = 0` when:** (a) out-of-hours
+   (generator-owned) OR (b) in-hours + Hard exception (reconciler-
+   owned) OR (c) in-hours + `order_id IS NOT NULL` (reconciler-
+   owned). Phase 4 booking workflow writes `(order_id=N,
+   availability=0)` atomically. See
+   [`docs/reconcile_exceptions.md` → Availability rule](./reconcile_exceptions.md#availability-rule).
 
 ## 9. How to use this file in a new chat
 
@@ -535,21 +615,34 @@ First message to a new Claude Code session in this repo:
 That's enough to give the new session full context in <5% of the
 context window, leaving plenty of room for the new work.
 
-If the new task is **`pc1.machineschedule`** (the next planned
-work), the relevant references are:
-- `docs/proceduresestimate.md` and `docs/scheduleexceptions.md` —
-  closest sibling table designs; both use the cross-tenant trigger
-  and standard audit columns
+If the new task is the **orders compatibility layer (Phase 3.5)**
+— the current next planned work — the relevant references are:
+- This file's §8 (full design context + decisions already locked
+  in + suggested work order)
+- `docs/proceduresestimate.md` — the catalog table the view will
+  JOIN against (4-shape override row design)
 - `migrations/0002_create_pc1_proceduresestimate.sql` and
   `migrations/0003_create_pc1_scheduleexceptions.sql` — sibling
-  migrations; use as templates for shape + trigger + indexes
-- `docs/novaris_exception_scraper.md` — the most recently-shipped
-  scraper, includes the "Measured performance" precedent
-- This file's §4 (conventions) and §8 (next-task notes)
+  migrations; use as templates for the new `pc1.orders` stub
+  (cross-tenant trigger, audit columns, source-tracking-quintet
+  pattern)
+- `docs/machineschedule.md` — defines the `seq` engine contract,
+  paired-array invariant, and the order_id-as-blocker rule that
+  Phase 4 booking workflow depends on
+- `docs/reconcile_exceptions.md` — defines the availability rule
+  (in-hours = 0 if Hard exception OR order_id NOT NULL); the
+  engine port reads slots subject to this rule
+- This file's §4 (conventions) — schema shape, scraper patterns,
+  audit columns, cross-tenant trigger pattern
+
+**At the start of the next session**, ask the user for the draft
+`pc1.orders_v` DDL — they explicitly said they'd provide it. Don't
+draft the view yourself before getting their input.
 
 ---
 
-*Last refreshed after PRs #4 + #5 landed. If this file is more than
-a few months old when you read it, expect drift between it and the
-actual codebase — the `git log` and per-table docs are the most
-trustworthy sources.*
+*Last refreshed after PR #9 landed (Phase 3 reconcile_exceptions.py
++ data refresh via daily-ops command sequence). If this file is
+more than a few months old when you read it, expect drift between
+it and the actual codebase — the `git log` and per-table docs are
+the most trustworthy sources.*
