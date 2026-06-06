@@ -137,6 +137,47 @@ ORDER BY order_id, pe_facility_id NULLS LAST, modality_id NULLS LAST;
 Expected per-patient row counts get filled in from the seed data once it's
 inserted (see the seed migration).
 
+## Seed test data (`migrations/0010_seed_test_orders.sql`)
+
+Non-prod seed: 8 test patients (`ris_account_no LIKE 'TEST-P%'`), 10 orders
+(`ris_order_id` 900001–900010), and 2 synthesized override rows on
+`CT - ABDOMEN (74150)` (`ris_metadata->>'seed' = '0010_seed_test_orders'`).
+Global `CT - ABDOMEN (74150)` is `required_slots=2`; the synthesized
+facility-level row (Antioch) is `3`, the per-machine row (Antioch / `CT-AMI`)
+is `4` — so the resolver has real tier variation.
+
+| Patient | Facility | Order(s) | Scenario | Expected `orders_v` rows |
+|---|---|---|---|---|
+| P01 Nguyen | Fremont | CT-ABDOMEN/PELVIS | single-modality | 1 |
+| P02 Carter | Fremont | XR-ABDOMEN/KUB/PELVIS COMBO | multi-CPT (`procedure_code` len 2) | 1 |
+| P03 Ruiz | Antioch | CT + XR combo | multi-modality | 2 |
+| P04 Lee | Fremont | XR-FINGER(s) LEFT | duplicate-global → no `DISTINCT ON` | 2 |
+| P05 Patel | Antioch | CT-ABDOMEN (74150) | per-facility + per-machine override | 3 |
+| P06 Diaz | Antioch | CT-ABDOMEN W/CONTRAST | single + future `requesting_date` (2026-06-21) | 1 |
+| P07 Lin | Fremont | CT-CALCIUM SCORING | single-modality | 1 |
+| P08 Cole | Fremont | CT-ABDOMEN/PELVIS + XR-AC JNTS | multi-modality + multi-CPT | 2 |
+
+Expected total view rows for the seed: **13** (assuming each referenced global
+procedure has exactly one global catalog row — P04 deliberately uses a
+duplicate-global one for the 2-row case; verify with the query below if other
+counts surface).
+
+```sql
+-- per-patient orders_v row counts for the seed (should match the table above)
+SELECT v.patient_id, p.patient_full_name, count(*) AS view_rows
+FROM pc1.orders_v v
+JOIN pc1.patients p ON p.id = v.patient_id
+WHERE p.ris_account_no LIKE 'TEST-P%'
+GROUP BY v.patient_id, p.patient_full_name
+ORDER BY p.patient_full_name;
+
+-- P05 override tiers: should show global(2) + facility(3) + facility+machine(4)
+SELECT order_id, facility_id, pe_facility_id, modality_id, required_slots
+FROM pc1.orders_v
+WHERE order_id = (SELECT id FROM pc1.orders WHERE ris_order_id = 900006)
+ORDER BY pe_facility_id NULLS FIRST, modality_id NULLS FIRST;
+```
+
 ## Related
 
 - [`pc1.orders`](./orders.md) — the underlying orders table
