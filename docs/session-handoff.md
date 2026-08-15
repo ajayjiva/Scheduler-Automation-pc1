@@ -376,8 +376,8 @@ The forward roadmap, in execution order:
 |---|---|---|---|
 | 1 | Port **`pc1.machineschedule`** — the slot calendar | **DONE** — schema migration `0004` (PR #7), generator `generate_machineschedule.py` (PR #8), migration `0005` (column rename to `date_and_time_utc`, seq, business-hours availability), all merged | Generator emits 24-hour grid; `availability=1` in business hours, `0` outside |
 | 2 | Port **`reconcile_exceptions.py`** | **DONE** — `reconcile_exceptions.py` + `docs/reconcile_exceptions.md` merged in PR #9. Reads active `pc1.scheduleexceptions` (modality FK match), overlays onto `pc1.machineschedule`. Availability rule: in-hours slots get `0` if any Hard exception OR `order_id IS NOT NULL`; out-of-hours slots untouched (generator owns them). Booked-slot Hard conflict surfaces a `CONFLICTS` warning + exit code 4 — `order_id` blocker rule lets the Phase 4 booking workflow coexist without write-ordering ceremony | Idempotent re-runs (no DB writes when desired state already matches). Default iterates all `is_client=true` facilities; `--facility=NAME` for one. Parallelism / batching ported verbatim from legacy. Past slots never modified (`range_start = max(--start-date, today)`) |
-| 3.5 | **Stub `pc1.orders` + `pc1.orders_v` compatibility-layer view** | **NEXT TASK** — see §8 | Decouples engine-port work (3.6) from the team's still-in-flight orders-schema decision. The user will provide a draft view definition at the start of the next session. Hand-crafted ~10 test orders (we'll insert patient rows jointly when we get there) |
-| 3.6 | Port the **scheduling engine** (`main.py` + helpers) | Deferred — depends on (3.5) | Reads from `pc1.orders_v` (the compatibility-layer view from 3.5). Same engine code regardless of the underlying orders table. Legacy reference: `main.py`, `get_orders.py`, `per_machine_resolver.py`, `first_modalitytype_scheduler.py`, `all_modality_scheduler.py`, `next_modalitytype_scheduler.py`, `cumulative_open_slots.py`, `resource_scheduler.py` |
+| 3.5 | **`pc1.orders_v` compatibility-layer view** (+ plain columns on `pc1.orders` / `pc1.patients`) | **DONE** — migrations `0006`–`0010` + `docs/orders.md`/`orders_v.md` on branch `claude/trusting-galileo-B97ad` (PR #11), verified in DB (13 view rows, override tiers 2/3/4, backfill clean) | `pc1.orders` already existed (RIS-shaped) so `0008` ALTERs it (not a stub create). View: multi-row per order, FK columns, `pe_facility_id` for the resolver, tenant+active scoping. `ris_*` (raw) vs plain (internal) column convention. Decouples engine-port work (3.6) from the team's still-evolving orders schema |
+| 3.6 | Port the **scheduling engine** (`main.py` + helpers) | **DONE** — engine ported to pc1 + migration `0011` (`pc1.machineschedule_v`) on branch `claude/trusting-galileo-B97ad` (PR #11); validated end-to-end against the live test DB for all 8 seed patients (see §8.9) | Reads `pc1.orders_v` + `pc1.machineschedule_v`. Key adaptations: legacy text columns → FK ids (`modality_type`/`modality_id`/`facility_id`/`pe_facility_id`), per-machine path keyed on `modality_id`, `date_and_time`→`date_and_time_utc`, params from `pc1.facilities`←`pc1.clients` via new `facility_settings.py` (no `clientparameters` table in pc1), schema-qualified `.schema("pc1")` reads. `next_modalitytype_scheduler.py` was dead code (not imported) — not ported. `stat_order`/`machine_skill`/`contrast_skill` softened to `.get()` (still deferred from the view) |
 | 4 | **Real orders schema** (team-driven) | Deferred — design in flux | When the team settles the orders schema, single migration ALTERs `pc1.orders` + replaces `pc1.orders_v`. Engine code from 3.6 keeps working because the view's column contract stays the same. |
 | — | Delete `MODALITY_MAP` + `FACILITY_MODALITIES` from `novaRIS_common.py` | Deferred — marked DEPRECATED in PR #3 | Final consolidation pass |
 | — | `pc1.user_profiles` lifecycle | Open question | Referenced by every audit FK but how does a row get into it? Login UI? Manual SQL? |
@@ -402,9 +402,18 @@ The forward roadmap, in execution order:
 - `generate_machineschedule.py` — blank-slot generator. Default iterates `is_client=true` facilities. 24-hour grid; `availability=1` in business hours, `0` outside. ON CONFLICT DO NOTHING idempotency. ~1,300 rows/sec.
 - `reconcile_exceptions.py` — exception overlay writer. Default iterates `is_client=true` facilities. In-hours `availability=0` when any Hard exception OR `order_id IS NOT NULL`; out-of-hours untouched. CONFLICTS warning + exit code 4 for booked-vs-Hard. ~14 s idempotent re-run per facility.
 
+**Scheduling engine (Phase 3.6 — validated, read-only options generator)**:
+- `main.py` — CLI orchestrator (`--patient-id`, `--client-id`, `--start-date`/`--end-date`, `--day-of-week`, `--month`, `--time-of-day`, `--max-options`, `--debug`). Pulls the patient's orders, resolves per-machine slot totals, loads `machineschedule_v` slots, builds + prunes appointment options, prints the patient-facing list.
+- `get_orders.py` — reads `pc1.orders_v`; 4-tier `summary_list` reduction.
+- `per_machine_resolver.py` — per-machine 4-tier precedence + combination enumeration (keyed on `modality_id`).
+- `first_modalitytype_scheduler.py`, `all_modality_scheduler.py`, `cumulative_open_slots.py`, `option_filters.py` — block eligibility, chain building, cumulative-open-slot walk, dedupe/Pareto/time-of-day filters.
+- `tz_helpers.py` — UTC↔facility-local (`date_and_time_utc`); `resolve_facility_tz()`.
+- `facility_settings.py` — **the pc1 params reader** (`pc1.facilities` override ← `pc1.clients` default); replaces the legacy `clientparameters` path. Defaults `use_technician_calendar=False`, `wait_threshold=0` when absent.
+- `resource_scheduler.py` — technician-calendar path; only exercised when `use_technician_calendar=true` (Inview = false, so inert / untested).
+
 **Shared infrastructure**:
 - `supabase_client.py` — `get_supabase()` factory (12 lines)
-- `client_context.py` — `resolve_client_id()` and `add_client_id_arg()` CLI helper (the `get_param`/`get_client_parameters` functions are legacy — read from a `clientparameters` table that doesn't exist in pc1; do NOT use them)
+- `client_context.py` — `resolve_client_id()` and `add_client_id_arg()` CLI helper (the `get_param`/`get_client_parameters` functions are legacy — read from a `clientparameters` table that doesn't exist in pc1; do NOT use them. The Phase 3.6 engine reads params via `facility_settings.py` instead)
 - `novaRIS_common.py` — `login()`, `make_session()`, form/HTML helpers, env-driven `BASE_URL`/`USERNAME`/`PASSWORD`
 
 **Test tenant**: `client_id = 1` (Inview Imaging). Real NovaRIS account
@@ -413,7 +422,8 @@ in `.env`. Live data as of last refresh (Phase 3 verification + daily-ops run):
 - `pc1.proceduresestimate`: 945 procedures
 - `pc1.scheduleexceptions`: ~16,000 exception rules across the 2 active facilities
 - `pc1.machineschedule`: ~50,000+ slots covering today → today + ~30 days; `exceptions[]` / `exception_ids[]` / `availability` reconciled and current
-- `pc1.orders`: **not yet created** — Phase 3.5 work
+- `pc1.orders`: **already exists** as a RIS-shaped table (`ris_order_id`, `ris_order_status`, `ris_order_type`, `ris_requesting_date`, … + sync quintet). Phase 3.5 ALTERs it to add the plain internal columns the view reads (`procedure_description` + `ris_procedure_description`, `order_status`, `order_type`, `requesting_date`, `preferred_language`, `is_active`) and a cross-tenant trigger. See [`docs/orders.md`](./orders.md). **Test orders seeded** (migration `0010`): 8 patients (`ris_account_no LIKE 'TEST-P%'`, ids 1–8), 10 orders (`ris_order_id` 900001–900010), 2 synthesized override rows on `CT - ABDOMEN (74150)`.
+- **`pc1.orders_v`** (view, migration `0009`) + **`pc1.machineschedule_v`** (view, migration `0011`) — the two compatibility-layer views the Phase 3.6 engine reads. `orders_v`: multi-row per order joining `proceduresestimate`. `machineschedule_v`: `machineschedule` JOIN `modalities` re-exposing `modality_type`/`modality_machine` (dropped from the base table) alongside the FKs. See [`docs/orders_v.md`](./orders_v.md), [`docs/machineschedule_v.md`](./machineschedule_v.md).
 
 **Active facilities** (`is_client = true` in `pc1.facilities`): Antioch Medical Imaging, Inview-Fremont. The other ~10 facility rows in `pc1.facilities` are inactive contracts retained for historical FK targets.
 
@@ -495,6 +505,12 @@ explicitly said they'd provide it. Once you have it, cross-check
 against this column list and flag any gaps.
 
 ### 8.4 Stub `pc1.orders` shape (proposal — confirm with user)
+
+> **SUPERSEDED during implementation.** `pc1.orders` already existed as a
+> RIS-shaped table, so we did not create a stub — `0008` ALTERs the existing
+> table to add the plain internal columns. The strawman below is kept only as a
+> record of the original plan; see [`docs/orders.md`](./orders.md) for the
+> actual shape.
 
 The view needs an underlying table. Until the team's real schema
 lands, we make a stub:
@@ -603,6 +619,55 @@ relies on. Don't break them:
    owned). Phase 4 booking workflow writes `(order_id=N,
    availability=0)` atomically. See
    [`docs/reconcile_exceptions.md` → Availability rule](./reconcile_exceptions.md#availability-rule).
+
+### 8.9 Phase 3.6 engine-port — result & validation
+
+The scheduling engine was ported to pc1 and validated end-to-end against the
+live test DB (`client_id=1`) for all 8 seed patients. Prerequisites for a repeat
+run: apply migrations `0006`–`0011`, then `generate_machineschedule.py` (+
+optionally `reconcile_exceptions.py`) for **Inview-Fremont** and **Antioch
+Medical Imaging**, then `python main.py --client-id=1 --patient-id=<1..8> --debug`.
+
+Key port adaptations (legacy → pc1):
+- Column contract: `module_type`→`modality_type`, `module`→`modality_id`,
+  `pe_facility`→`pe_facility_id`, `facility`→`facility_id` (FK ints, not text);
+  `date_and_time`→`date_and_time_utc`.
+- **Per-machine identity keyed on `modality_id`** (int FK) throughout — the
+  override pin and the machine inventory now agree; `modality_machine` is carried
+  for display only. `machineschedule_v` (migration `0011`) supplies
+  `modality_type`/`modality_machine` via a `modalities` join.
+- Params from `facility_settings.py` (`pc1.facilities`←`pc1.clients`), not
+  `clientparameters`. Schema-qualified `.schema("pc1")` reads.
+- `next_modalitytype_scheduler.py` not ported (dead code — unused by `main.py`).
+- `stat_order`/`machine_skill`/`contrast_skill` softened to `.get()`; still
+  deferred from `orders_v` (add columns if/when real logic consumes them).
+
+Validation matrix (duration = total_slots × 15 min):
+
+| patient | scenario | result |
+|---|---|---|
+| 1 / 7 | single global CT | 30 min (2 slots) |
+| 2 | multi-CPT XR | 15 min (1 slot) |
+| 4 | duplicate-global XR | 30 min (2 slots) — multi-row dedup, NOT double-counted |
+| 5 | per-machine override CT (`CT-AMI`) | **60 min (4 slots)** — tier-1 resolution |
+| 6 | global CT, no machine override | 45 min (3 slots) |
+| 3 | multi-modality @ Antioch | 45 min chain, `CT-AMI ≫ CR-AMI`, no wait |
+| 8 | multi-modality @ Fremont | 45 min chain, `FRE-CT ≫ DX-FRE`, no wait |
+
+Every mechanic confirmed: 4-tier precedence, per-machine override, multi-row
+dedup, multi-modality chaining at both facilities, business-hours cutoff,
+facility-local display, same-day floor.
+
+Not exercised (documented gaps, not failures):
+- The **multi-combination per-machine path** (`has_per_machine_variation`) never
+  triggers with the current data — each modality has only one active machine per
+  facility, so there's no cross-machine slot variation. P05 exercises the
+  override via the summary/legacy path. To exercise the combination path, seed a
+  2nd same-modality machine with a different override.
+- `resource_scheduler.py` / technician calendar (Inview `use_technician_calendar`
+  is false).
+- `requesting_date` start-floor override — not implemented (documented as future
+  engine work; the P06 seed value is now past-dated anyway).
 
 ## 9. How to use this file in a new chat
 
