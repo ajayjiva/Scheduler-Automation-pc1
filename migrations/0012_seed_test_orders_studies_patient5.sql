@@ -18,6 +18,10 @@
 -- script substitutes distinct placeholder values (800001-800004) instead
 -- -- flag/replace these if real RIS study ids are available.
 --
+-- NOTE on ris_study_status: pc1.studies.ris_study_status is varchar(10).
+-- 'Unscheduled' (11 chars) overflows it, so this script uses 'Unsched'
+-- instead -- swap in the real RIS vocabulary once it's confirmed.
+--
 -- This script is IDEMPOTENT: it deletes any prior seed rows (by the
 -- ris_order_id tag) before re-inserting, so it can be replayed.
 --
@@ -51,7 +55,7 @@ INSERT INTO pc1.studies
      ris_study_status, ris_study_description, ris_cpt_code, ris_modality, ris_duration)
 SELECT
     1, v.ris_study_id, io.id, 3,
-    'Unscheduled', v.ris_study_description, v.ris_cpt_code, v.ris_modality, 30
+    'Unsched', v.ris_study_description, v.ris_cpt_code, v.ris_modality, 30
 FROM (VALUES
     -- (ris_order_id, ris_study_id, description, cpt, modality)
     (1001::bigint, 800001::bigint, 'MRI - LSPINE (72148)', '{72148}', 'MR'),
