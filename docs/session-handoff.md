@@ -402,10 +402,11 @@ The forward roadmap, in execution order:
 - `generate_machineschedule.py` — blank-slot generator. Default iterates `is_client=true` facilities. 24-hour grid; `availability=1` in business hours, `0` outside. ON CONFLICT DO NOTHING idempotency. ~1,300 rows/sec.
 - `reconcile_exceptions.py` — exception overlay writer. Default iterates `is_client=true` facilities. In-hours `availability=0` when any Hard exception OR `order_id IS NOT NULL`; out-of-hours untouched. CONFLICTS warning + exit code 4 for booked-vs-Hard. ~14 s idempotent re-run per facility.
 
-**Scheduling engine (Phase 3.6 — validated, read-only options generator)**:
-- `main.py` — CLI orchestrator (`--patient-id`, `--client-id`, `--start-date`/`--end-date`, `--day-of-week`, `--month`, `--time-of-day`, `--max-options`, `--debug`). Pulls the patient's orders, resolves per-machine slot totals, loads `machineschedule_v` slots, builds + prunes appointment options, prints the patient-facing list.
-- `get_orders.py` — reads `pc1.orders_v`; 4-tier `summary_list` reduction.
-- `per_machine_resolver.py` — per-machine 4-tier precedence + combination enumeration (keyed on `modality_id`).
+**Scheduling engine (Phase 3.7 — study-array input, read-only options generator)**:
+- `main.py` — CLI orchestrator (`--studies-file`, `--client-id`, `--start-date`/`--end-date`, `--day-of-week`, `--month`, `--time-of-day`, `--max-options`, `--debug`). Reads a caller-supplied JSON file (`{"studies": [...], "filters": {...}}` — see `get_studies.py`), resolves per-machine slot totals, loads `machineschedule_v` slots, builds + prunes appointment options, prints the patient-facing list. `--patient-id`/`pc1.orders_v` input retired (production doesn't use `orders_v`); `filters` in the JSON mirror the CLI date/day/month/time-of-day/max-options flags, with an explicit CLI flag always winning over the JSON value.
+- `get_orders.py` — reads `pc1.orders_v`; 4-tier `summary_list` reduction. **Unwired from `main.py`** as of Phase 3.7 (kept in the repo, not deleted) — superseded by `get_studies.py`.
+- `get_studies.py` — resolves a caller-supplied study-row array (one row per procedure, not per order) into the same `(summary_list, rows, facility_id)` shape `get_orders.py` used to produce. No override (`duration`/`required_slots`) given → matches `pc1.proceduresestimate` by CPT-code set-equality (not `procedure_desc` text); override given → bypasses the catalog entirely and applies uniformly across every candidate machine (ceiling-rounds `duration` to slots via the same formula `novaRIS_standardprocedure_scraper.required_slots_from_minutes` uses, duplicated locally to avoid a heavy scraper-module import).
+- `per_machine_resolver.py` — per-machine 4-tier precedence + combination enumeration (keyed on `modality_id`). Grouping key renamed `order_id` → `study_id` in Phase 3.7 (pure rename, algorithm unchanged) to match `get_studies.py`'s row shape.
 - `first_modalitytype_scheduler.py`, `all_modality_scheduler.py`, `cumulative_open_slots.py`, `option_filters.py` — block eligibility, chain building, cumulative-open-slot walk, dedupe/Pareto/time-of-day filters.
 - `tz_helpers.py` — UTC↔facility-local (`date_and_time_utc`); `resolve_facility_tz()`.
 - `facility_settings.py` — **the pc1 params reader** (`pc1.facilities` override ← `pc1.clients` default); replaces the legacy `clientparameters` path. Defaults `use_technician_calendar=False`, `wait_threshold=0` when absent.
@@ -669,6 +670,67 @@ Not exercised (documented gaps, not failures):
 - `requesting_date` start-floor override — not implemented (documented as future
   engine work; the P06 seed value is now past-dated anyway).
 
+### 8.10 Phase 3.7 — study-array input (replaces pc1.orders_v)
+
+Production does not use `pc1.orders_v`. The scheduler's input was changed
+from a `patient_id` → `pc1.orders_v` DB query to a caller-supplied JSON
+file of **study rows** — one row per procedure ("one order, two
+procedures" is now two study rows), each already carrying its facility,
+modality, and CPT code(s), with optional per-row `duration`/`required_slots`
+overrides.
+
+Key decisions:
+- **New module `get_studies.py`** produces the exact same
+  `(summary_list, rows, facility_id)` shape `get_orders.py` used to, so
+  `per_machine_resolver.py` and everything below it in the pipeline
+  (`first_modalitytype_scheduler.py`, `all_modality_scheduler.py`,
+  `option_filters.py`, `cumulative_open_slots.py`, `resource_scheduler.py`)
+  needed **zero changes** beyond the key rename below — confirmed by full
+  reads of each, not assumed.
+- **Catalog match key changed** from `procedure_desc` text-equality
+  (`orders_v`'s join) to `procedure_code` (CPT array) set-equality — an
+  order-insensitive comparison, not the GIN index's raw `.overlaps()`
+  containment (which would over-match a combo procedure against a
+  single-code catalog row). Nothing about how `procedure_code` is derived
+  or stored on `pc1.proceduresestimate` changed, only the lookup key.
+- **Override precedence**: a study row's `duration`/`required_slots`, when
+  given, always wins over the catalog and applies uniformly to every
+  candidate machine (a synthetic tier-4-shaped row, since it's the only
+  row for that study). `duration` ceiling-rounds to slots — 20 min at a
+  15-min slot size becomes 2 slots (30 min), never floored to 1.
+- **`order_id` → `study_id` rename** in `per_machine_resolver.py`: pure
+  key rename, the 4-tier precedence math and combination enumeration are
+  byte-for-byte unchanged.
+- **Facility-settings fetch reordered before study resolution** in
+  `main.py` — `facility_id` is already on every study row (no more
+  chicken-and-egg with orders), so `slot_size_minutes` is known before
+  resolving any `duration` overrides.
+- **JSON file shape**: `{"studies": [...], "filters": {...}}`. `filters`
+  is optional and mirrors the CLI's `start_date`/`end_date`/`day_of_week`/
+  `month`/`time_of_day`/`max_options` flags; an explicit CLI flag always
+  wins over the JSON value, which wins over the prior hardcoded default.
+  Sample file: `test_data/studies_sample.json`.
+- **Single-patient validation**: hard error if study rows span more than
+  one `facility_id` (the scheduler can't run against two facilities at
+  once); a **warning only** (not a failure) if they span more than one
+  `patient_id`.
+- `get_orders.py` / `pc1.orders_v` are **not deleted**, just unwired from
+  `main.py` — kept in the repo as a legacy/reference path.
+- New test-data script: `migrations/0013_reset_test_calendar_data.sql`
+  (calendar wipe + synthetic `scheduleexceptions` rows + booked-slot
+  marking; the actual calendar regeneration is a `generate_machineschedule.py`
+  / `reconcile_exceptions.py` CLI invocation, not SQL — see the file's
+  comments for the exact commands).
+
+Not yet validated end-to-end against a live DB in this session (no DB
+credentials available) — verified instead with synthetic/mocked Supabase
+responses exercising `get_studies.get_summary_list()` and
+`per_machine_resolver.resolve_per_machine_slots()` together (per-machine
+override selection, duration-to-slots ceiling rounding, multi-shape
+catalog resolution all confirmed correct). Run the real end-to-end check
+per this section's test-data script + `test_data/studies_sample.json`
+before trusting this in production.
+
 ## 9. How to use this file in a new chat
 
 First message to a new Claude Code session in this repo:
@@ -706,8 +768,8 @@ draft the view yourself before getting their input.
 
 ---
 
-*Last refreshed after PR #9 landed (Phase 3 reconcile_exceptions.py
-+ data refresh via daily-ops command sequence). If this file is
-more than a few months old when you read it, expect drift between
-it and the actual codebase — the `git log` and per-table docs are
+*Last refreshed after the Phase 3.7 study-array input change (§8.10) —
+`get_studies.py` replaces `pc1.orders_v` as main.py's input source. If
+this file is more than a few months old when you read it, expect drift
+between it and the actual codebase — the `git log` and per-table docs are
 the most trustworthy sources.*

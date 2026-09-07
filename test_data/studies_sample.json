@@ -1,0 +1,13 @@
+{
+  "_comment": "Sample --studies-file input for main.py. patient_id 5 / facility_id 3 (Antioch) / client_id 1 match the TEST-P05 patient and CPT codes already seeded in migrations/0010 and migrations/0012 -- use these as-is against a dev DB that has those migrations applied, or substitute your own study_id/patient_id/facility_id/procedure_code values.",
+  "studies": [
+    {"study_id": 1, "patient_id": 5, "facility_id": 3, "procedure_code": ["72148"], "modality_type": "MR"},
+    {"study_id": 2, "patient_id": 5, "facility_id": 3, "procedure_code": ["72146"], "modality_type": "MR"},
+    {"study_id": 3, "patient_id": 5, "facility_id": 3, "procedure_code": ["72126"], "modality_type": "CT"},
+    {"study_id": 4, "patient_id": 5, "facility_id": 3, "procedure_code": ["93976"], "modality_type": "US", "duration": 20}
+  ],
+  "filters": {
+    "time_of_day": "any",
+    "max_options": 25
+  }
+}

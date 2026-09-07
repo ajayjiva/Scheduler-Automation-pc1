@@ -1,8 +1,9 @@
 """
 Per-machine procedure-estimate resolver (Phase 3.6 pc1 port).
 
-Translates the multi-row pc1.orders_v shape (one row per matching
-proceduresestimate shape) into the structures the scheduler needs:
+Translates the multi-row study shape (one row per matching
+proceduresestimate shape, produced by get_studies.get_summary_list) into
+the structures the scheduler needs:
 
     - resolve_per_machine_slots(...)  -> {modality_type: {modality_id: total_slots}}
     - has_per_machine_variation(...)  -> bool gate for the per-machine path
@@ -12,12 +13,12 @@ proceduresestimate shape) into the structures the scheduler needs:
 pc1 changes vs the legacy bundle
 --------------------------------
 The candidate-machine identity is `modality_id` (the int FK), NOT the
-`modality_machine` name. pc1.orders_v exposes the per-machine override pin as
-`modality_id` and the per-facility tier as `pe_facility_id` (both int FKs), so
-every tier comparison is ID == ID. The machine inventory is likewise keyed on
-`modality_id` (from machineschedule_v). The human-readable machine name
-(`modality_machine`) is carried on the slot rows for display only and never
-used as a key here.
+`modality_machine` name. Each study row carries the per-machine override pin
+as `modality_id` and the per-facility tier as `pe_facility_id` (both int
+FKs), so every tier comparison is ID == ID. The machine inventory is
+likewise keyed on `modality_id` (from machineschedule_v). The human-readable
+machine name (`modality_machine`) is carried on the slot rows for display
+only and never used as a key here.
 
 Pure / side-effect free / no DB access.
 """
@@ -28,14 +29,14 @@ from itertools import product
 
 # ── Resolution ────────────────────────────────────
 
-# 4-tier precedence over a single orders_v row, for one candidate machine
+# 4-tier precedence over a single study row, for one candidate machine
 # (identified by modality_id). Lower index = more specific = preferred.
-#   tier 1 -> pe.facility_id == order.facility_id AND pe.modality_id == candidate
-#   tier 2 -> pe.facility_id == order.facility_id AND pe.modality_id IS NULL
+#   tier 1 -> pe.facility_id == study.facility_id AND pe.modality_id == candidate
+#   tier 2 -> pe.facility_id == study.facility_id AND pe.modality_id IS NULL
 #   tier 3 -> pe.facility_id IS NULL              AND pe.modality_id == candidate
 #   tier 4 -> pe.facility_id IS NULL              AND pe.modality_id IS NULL
-def _row_tier(row, order_facility_id, candidate_modality_id):
-    row_facility_match = row.get("pe_facility_id") == order_facility_id
+def _row_tier(row, study_facility_id, candidate_modality_id):
+    row_facility_match = row.get("pe_facility_id") == study_facility_id
     row_global = row.get("pe_facility_id") is None
     row_pinned_to_machine = row.get("modality_id") == candidate_modality_id
     row_machine_null = row.get("modality_id") is None
@@ -51,14 +52,14 @@ def _row_tier(row, order_facility_id, candidate_modality_id):
     return None  # row doesn't apply to this (facility, machine)
 
 
-def _required_slots_for(rows_for_order, order_facility_id, candidate_modality_id):
-    """Resolve required_slots for one (order, candidate machine) via the most
+def _required_slots_for(rows_for_study, study_facility_id, candidate_modality_id):
+    """Resolve required_slots for one (study, candidate machine) via the most
     specific applicable tier, or None if no shape applies (data-quality gap).
     """
     best_tier = None
     best_slots = None
-    for row in rows_for_order:
-        tier = _row_tier(row, order_facility_id, candidate_modality_id)
+    for row in rows_for_study:
+        tier = _row_tier(row, study_facility_id, candidate_modality_id)
         if tier is None:
             continue
         if best_tier is None or tier < best_tier:
@@ -71,53 +72,54 @@ def resolve_per_machine_slots(view_rows, machines_by_modality):
     """Compute per-(modality, machine) total required_slots.
 
     Args:
-        view_rows: list of pc1.orders_v dicts (multi-row shape). Keys used:
-            order_id, facility_id, modality_type, modality_id (the pe pin;
+        view_rows: list of study-row dicts (multi-row shape, from
+            get_studies.get_summary_list). Keys used:
+            study_id, facility_id, modality_type, modality_id (the pe pin;
             may be None), pe_facility_id (may be None), required_slots.
         machines_by_modality: {modality_type: [modality_id, ...]} from
             derive_machines_from_machineschedule.
 
     Returns (per_machine_slots, unresolvable):
         per_machine_slots: {modality_type: {modality_id: total_slots}}
-        unresolvable: [(modality_type, modality_id, order_id), ...] machines
-            that cannot serve some order (excluded from combinations).
+        unresolvable: [(modality_type, modality_id, study_id), ...] machines
+            that cannot serve some study (excluded from combinations).
     """
-    rows_by_order = defaultdict(list)
-    order_facility = {}
-    order_modality = {}
+    rows_by_study = defaultdict(list)
+    study_facility = {}
+    study_modality = {}
     for row in view_rows:
-        oid = row["order_id"]
-        rows_by_order[oid].append(row)
-        order_facility[oid] = row.get("facility_id")
-        order_modality[oid] = row.get("modality_type")
+        sid = row["study_id"]
+        rows_by_study[sid].append(row)
+        study_facility[sid] = row.get("facility_id")
+        study_modality[sid] = row.get("modality_type")
 
-    orders_by_modality = defaultdict(list)
-    for oid, modality in order_modality.items():
-        orders_by_modality[modality].append(oid)
+    studies_by_modality = defaultdict(list)
+    for sid, modality in study_modality.items():
+        studies_by_modality[modality].append(sid)
 
     per_machine_slots = {}
     unresolvable = []
 
     for modality, candidate_machines in machines_by_modality.items():
-        modality_orders = orders_by_modality.get(modality, [])
-        if not modality_orders:
-            continue  # patient has no orders for this modality
+        modality_studies = studies_by_modality.get(modality, [])
+        if not modality_studies:
+            continue  # patient has no studies for this modality
 
         modality_totals = {}
         for machine in candidate_machines:
             total = 0
-            failed_order = None
-            for oid in modality_orders:
+            failed_study = None
+            for sid in modality_studies:
                 slots = _required_slots_for(
-                    rows_by_order[oid], order_facility[oid], machine
+                    rows_by_study[sid], study_facility[sid], machine
                 )
                 if slots is None:
-                    failed_order = oid
+                    failed_study = sid
                     break
                 total += slots
 
-            if failed_order is not None:
-                unresolvable.append((modality, machine, failed_order))
+            if failed_study is not None:
+                unresolvable.append((modality, machine, failed_study))
                 continue
 
             modality_totals[machine] = total

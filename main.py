@@ -29,12 +29,13 @@ load_dotenv()
 
 import argparse
 import itertools
+import json
 from datetime import date, datetime, time, timedelta, timezone
 
 from supabase_client import get_supabase
 from client_context import add_client_id_arg, resolve_client_id
 from facility_settings import get_facility_settings
-from get_orders import get_summary_list
+from get_studies import get_summary_list
 from first_modalitytype_scheduler import get_first_modality_block
 
 from cumulative_open_slots import (
@@ -232,33 +233,89 @@ def _build_options_per_machine(
     return all_options
 
 
+def _load_studies_payload(path):
+    """Load {"studies": [...], "filters": {...}} from a JSON file.
+
+    `filters` is optional and may carry any of: start_date, end_date,
+    day_of_week, month, time_of_day, max_options — the same knobs exposed
+    as CLI flags below. A CLI flag, if explicitly passed, always wins over
+    the JSON value; the JSON value wins over the hardcoded default.
+    """
+    with open(path, "r") as f:
+        payload = json.load(f)
+    study_rows = payload.get("studies")
+    if not study_rows:
+        raise ValueError(f"{path}: no \"studies\" array found (or it's empty).")
+    required_keys = {"study_id", "patient_id", "facility_id", "modality_type"}
+    for row in study_rows:
+        missing = required_keys - row.keys()
+        if missing:
+            raise ValueError(f"{path}: study row {row!r} missing keys {missing}.")
+        if row.get("procedure_code") is None and row.get("duration") is None \
+                and row.get("required_slots") is None:
+            raise ValueError(
+                f"{path}: study row {row!r} has neither procedure_code nor "
+                f"a duration/required_slots override."
+            )
+    filters = payload.get("filters") or {}
+    return study_rows, filters
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-modality scheduler (pc1).")
     add_client_id_arg(parser)
-    parser.add_argument("--patient-id", type=int, default=10001,
-                        help="Patient ID to schedule (pc1.patients.id).")
+    parser.add_argument("--studies-file", type=str, required=True,
+                        help="Path to a JSON file: "
+                             '{"studies": [...], "filters": {...}}. See '
+                             "get_studies.py for the study-row shape.")
     parser.add_argument("--start-date", type=str, default=None,
                         help="Earliest date (YYYY-MM-DD). Default: dynamic "
-                             "(now + 1 slot) rounded up.")
+                             "(now + 1 slot) rounded up, or the JSON "
+                             "filters.start_date if set.")
     parser.add_argument("--end-date", type=str, default=None,
                         help="Latest date (YYYY-MM-DD, inclusive). Default: "
-                             "today + advance_booking_days (or +180).")
+                             "today + advance_booking_days (or +180), or "
+                             "the JSON filters.end_date if set.")
     parser.add_argument("--day-of-week", type=str, default=None,
-                        help="Comma-sep weekdays (mon..sun or 0..6). Default: all.")
+                        help="Comma-sep weekdays (mon..sun or 0..6). Default: "
+                             "all, or the JSON filters.day_of_week if set.")
     parser.add_argument("--month", type=str, default=None,
-                        help="Comma-sep months (jan..dec or 1..12). Default: all.")
-    parser.add_argument("--time-of-day", type=str, default="any",
+                        help="Comma-sep months (jan..dec or 1..12). Default: "
+                             "all, or the JSON filters.month if set.")
+    parser.add_argument("--time-of-day", type=str, default=None,
                         choices=["morning", "afternoon", "any"],
-                        help="Restrict START time. Default: any.")
-    parser.add_argument("--max-options", type=int, default=DEFAULT_MAX_OPTIONS,
-                        help=f"Max options to display (default {DEFAULT_MAX_OPTIONS}; "
-                             f"0 = all).")
+                        help="Restrict START time. Default: any, or the "
+                             "JSON filters.time_of_day if set.")
+    parser.add_argument("--max-options", type=int, default=None,
+                        help=f"Max options to display (default "
+                             f"{DEFAULT_MAX_OPTIONS}, or the JSON "
+                             f"filters.max_options if set; 0 = all).")
     parser.add_argument("--debug", action="store_true",
                         help="Verbose internal state.")
     args = parser.parse_args()
 
     global DEBUG
     DEBUG = args.debug
+
+    study_rows, filters = _load_studies_payload(args.studies_file)
+
+    # CLI flag (if passed) wins over the JSON filters value, which wins
+    # over the hardcoded default.
+    def _resolved_filter(cli_value, key, hardcoded_default):
+        if cli_value is not None:
+            return cli_value
+        if filters.get(key) is not None:
+            return filters[key]
+        return hardcoded_default
+
+    args.start_date = _resolved_filter(args.start_date, "start_date", None)
+    args.end_date = _resolved_filter(args.end_date, "end_date", None)
+    args.day_of_week = _resolved_filter(args.day_of_week, "day_of_week", None)
+    args.month = _resolved_filter(args.month, "month", None)
+    args.time_of_day = _resolved_filter(args.time_of_day, "time_of_day", "any")
+    args.max_options = _resolved_filter(
+        args.max_options, "max_options", DEFAULT_MAX_OPTIONS
+    )
 
     weekdays_filter = parse_weekdays(args.day_of_week)
     months_filter = parse_months(args.month)
@@ -267,18 +324,16 @@ def main():
 
     client_id = resolve_client_id(args)
     supabase = get_supabase()
-    patient_id = args.patient_id
 
-    # Orders first — they tell us the facility, which selects the settings.
-    summary_list, rows, facility_id = get_summary_list(
-        supabase, patient_id=patient_id, client_id=client_id
-    )
-    if not summary_list:
-        print("No orders found for patient:", patient_id)
+    # facility_id is already on every study row (no more chicken-and-egg
+    # with orders) -- pull it out up front so facility settings can be
+    # fetched before resolving studies against the catalog.
+    facility_ids = {r["facility_id"] for r in study_rows}
+    if len(facility_ids) != 1:
+        print(f"ERROR: --studies-file must contain exactly one facility_id; "
+              f"found {sorted(facility_ids)}.")
         return
-    if not facility_id:
-        print("No facility found for patient orders:", patient_id)
-        return
+    facility_id = facility_ids.pop()
 
     # Per-facility settings (facility overrides client default).
     cp = get_facility_settings(supabase, client_id, facility_id)
@@ -289,6 +344,15 @@ def main():
     closing_time = parse_clock_time(cp.get("closing_time"))
     facility_tz = resolve_facility_tz(cp)
     advance_booking_days = int(cp.get("advance_booking_days") or 180)
+
+    # Resolve studies against the catalog (or their overrides) now that
+    # slot_size_minutes is known.
+    summary_list, rows, facility_id = get_summary_list(
+        supabase, study_rows, client_id, slot_size_minutes
+    )
+    if not summary_list:
+        print("No schedulable studies found in:", args.studies_file)
+        return
 
     if DEBUG:
         print(f"\nCLIENT: {cp.get('client_name')!r} (id={client_id})  "
@@ -303,7 +367,7 @@ def main():
     modality_order = [item["modality_type"] for item in summary_list]
 
     if DEBUG:
-        print("\n--- ORDERS SUMMARY ---")
+        print("\n--- STUDIES SUMMARY ---")
         for item in summary_list:
             print(item)
         print("\nFACILITY_ID:", facility_id)
@@ -423,8 +487,8 @@ def main():
     if unresolvable:
         print("\n--- DATA-QUALITY ISSUES "
               "(some (modality, machine) pairs have no fallback shape) ---")
-        for modality, machine_id, order_id in unresolvable:
-            print(f"  Order {order_id} ({modality}): no proceduresestimate "
+        for modality, machine_id, study_id in unresolvable:
+            print(f"  Study {study_id} ({modality}): no proceduresestimate "
                   f"shape resolvable for modality_id {machine_id}; that "
                   f"machine is excluded. Fix: add a (facility, modality_id=NULL) "
                   f"or (facility, modality_id={machine_id}) row for this procedure.")
