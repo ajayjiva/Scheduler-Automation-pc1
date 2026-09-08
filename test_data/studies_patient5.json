@@ -1,0 +1,9 @@
+{
+  "_comment": "Reproduces the original 'python main.py --client-id=1 --patient-id=5' CLI test. Same procedure as migrations/0010 order 900006 (CT - ABDOMEN (74150), TEST-P05, Antioch). Per docs/session-handoff.md §8.9, expect 60 min (4 slots) via tier-1 per-machine override resolution (CT-AMI).",
+  "studies": [
+    {"study_id": 501, "patient_id": 5, "facility_id": 3, "procedure_code": ["74150"], "modality_type": "CT"}
+  ],
+  "filters": {
+    "max_options": 5
+  }
+}
