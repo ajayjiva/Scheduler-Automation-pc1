@@ -722,14 +722,26 @@ Key decisions:
   / `reconcile_exceptions.py` CLI invocation, not SQL — see the file's
   comments for the exact commands).
 
-Not yet validated end-to-end against a live DB in this session (no DB
-credentials available) — verified instead with synthetic/mocked Supabase
-responses exercising `get_studies.get_summary_list()` and
-`per_machine_resolver.resolve_per_machine_slots()` together (per-machine
-override selection, duration-to-slots ceiling rounding, multi-shape
-catalog resolution all confirmed correct). Run the real end-to-end check
-per this section's test-data script + `test_data/studies_sample.json`
-before trusting this in production.
+**Validated end-to-end against the live dev DB** (2026-09-08, user-run):
+`test_data/studies_patient5.json` and `test_data/studies_patient3.json`
+(mirroring migrations/0010's TEST-P05/TEST-P03 orders) reproduced the exact
+`--patient-id`-era results recorded in §8.9 — patient 5: 60 min / 4 slots
+via tier-1 per-machine override (`CT-AMI`); patient 3: 45 min chain,
+`CT-AMI >> CR-AMI`, no wait. One real finding from this run: the combo
+procedure (74018,72170)'s catalog `modality_type` is `CR`, not the `XR`
+initially guessed from its procedure_desc text — the modality-mismatch
+warning (§8.10 design, "trust the input's modality_type") caught this
+correctly and aborted safely rather than silently misscheduling; the test
+fixture was corrected to `CR` and re-run clean. Prior to this, the same
+logic was verified offline with synthetic/mocked Supabase responses
+exercising `get_studies.get_summary_list()` and
+`per_machine_resolver.resolve_per_machine_slots()` together.
+
+Open follow-up from this finding: whether a catalog-matched study should
+trust the *catalog's* `modality_type` over the caller's declared one (self-
+correcting, still warned) instead of the current hard-abort-on-mismatch
+behavior — undecided as of this writing, see the chat discussion around
+2026-09-08 for the tradeoff.
 
 ## 9. How to use this file in a new chat
 
