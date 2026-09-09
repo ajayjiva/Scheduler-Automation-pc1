@@ -737,11 +737,33 @@ logic was verified offline with synthetic/mocked Supabase responses
 exercising `get_studies.get_summary_list()` and
 `per_machine_resolver.resolve_per_machine_slots()` together.
 
-Open follow-up from this finding: whether a catalog-matched study should
-trust the *catalog's* `modality_type` over the caller's declared one (self-
-correcting, still warned) instead of the current hard-abort-on-mismatch
-behavior — undecided as of this writing, see the chat discussion around
-2026-09-08 for the tradeoff.
+**Resolved (2026-09-09): `modality_type` removed from the input entirely.**
+The XR/CR finding above led to a design correction, not just a fixture
+fix: `modality_type` is no longer a caller-supplied field at all — it is
+*always* derived from `pc1.proceduresestimate` via `procedure_code`, for
+every study, override or not (the override only ever replaces the
+catalog's *timing* value, never the modality lookup). This closes the
+mismatch class entirely rather than just warning about it. Consequences:
+- `procedure_code` is now **mandatory on every study row** — previously a
+  row could skip it if it supplied a `duration`/`required_slots` override
+  instead; that escape hatch is gone, since `procedure_code` is now the
+  only way to determine modality.
+- If a `procedure_code` has **no** catalog match at all (new code not yet
+  synced by the scraper, typo, etc.), that one study is skipped with a
+  clearly-labeled `ERROR:` print and the run continues with whatever
+  other studies in the file *do* resolve — not a whole-run abort.
+- Catalog lookups are cached per distinct CPT-code set for the whole run,
+  so deriving `modality_type` this way costs at most one indexed query per
+  distinct `procedure_code` combination in the file, not per study and not
+  per row — verified negligible, not just assumed.
+- Confirmed offline (mocked catalog) that an override still applies
+  uniformly across every candidate machine for a modality, ignoring
+  per-machine speed variation — e.g. a 30-min override on a procedure
+  where one machine's standard time is 15 min still books 30 min on that
+  faster machine, exactly as intended for caller-specified exceptions to
+  the standard estimate.
+- `test_data/studies_*.json` updated accordingly: no `modality_type` key
+  on any study row.
 
 ## 9. How to use this file in a new chat
 

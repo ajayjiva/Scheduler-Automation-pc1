@@ -5,9 +5,14 @@ source; production does not use pc1.orders_v).
 
 The caller supplies one row per **study** (= one procedure), not per
 order — a doctor's single order for two procedures now arrives as two
-study rows. Each row already carries its facility, modality, and CPT
-code(s); `duration` (minutes) or `required_slots` are optional per-row
-overrides that always take precedence over the catalog lookup below.
+study rows. Each row carries its facility and CPT code(s); `duration`
+(minutes) or `required_slots` are optional per-row overrides that always
+take precedence over the catalog's standard time for that procedure.
+
+`procedure_code` is mandatory on every row, override or not: it is the
+*only* way modality_type is determined (see below), so even a row that
+overrides its duration still needs its CPT code to know what kind of
+machine to search.
 
 Row shape produced (identical to what pc1.orders_v returned, keyed by
 `study_id` instead of `order_id`) so per_machine_resolver.py and
@@ -15,14 +20,31 @@ everything downstream needs no further changes:
     study_id, facility_id, modality_type, modality_id (nullable pin),
     pe_facility_id (nullable pin), required_slots, procedure_description
 
-Catalog lookup (only when neither duration nor required_slots is given)
---------------------------------------------------------------------
+modality_type is always catalog-derived, never caller-supplied
+-----------------------------------------------------------
+Earlier versions of this module accepted a caller-supplied modality_type
+and only warned on a mismatch against the catalog. That was found (via a
+live test) to be a real footgun: a caller-declared value can be wrong
+(e.g. "XR" typed for a procedure the catalog stores as "CR"), and trusting
+it caused correct catalog data to be silently ignored. modality_type is
+now taken *only* from the matched pc1.proceduresestimate row(s) -- there
+is no input field for it at all. If procedure_code doesn't match anything
+in the catalog, there's no way to know the modality, so that study is
+skipped with an ERROR (see get_summary_list) rather than guessed at.
+
+Catalog lookup (procedure_code set-equality)
+--------------------------------------------
 pc1.orders_v matched pc1.proceduresestimate by exact procedure_desc text.
 Studies carry CPT codes directly, so this module matches by procedure_code
 (text[]) instead: order-insensitive set equality, not the GIN index's raw
 `.overlaps()` containment (which would over-match a combo procedure against
 a catalog row for just one of its codes). Nothing about how procedure_code
 is derived/stored on pc1.proceduresestimate changes -- only the lookup key.
+This lookup runs for EVERY study, including ones with a duration/
+required_slots override -- the override only replaces the catalog's timing
+value, never the modality lookup. Queries are cached per distinct CPT-code
+set for the whole run (see _fetch_catalog_matches), so this costs at most
+one indexed query per distinct procedure_code combination, not per study.
 
 No facility filter is applied in the query, same as orders_v (migrations/
 0009): the Python 4-tier resolver, not SQL, owns facility/machine
@@ -117,14 +139,18 @@ def get_summary_list(supabase, study_rows, client_id, slot_size_minutes):
     1) Validate all study_rows share one facility_id (hard error -- the
        scheduler can only run against one facility per invocation) and warn
        (not fail) if they don't share one patient_id.
-    2) For each study row: a duration/required_slots override bypasses the
-       catalog entirely and emits one synthetic global-tier row (applies
-       uniformly to every candidate machine). Otherwise, look up
-       pc1.proceduresestimate by CPT-code set-equality and emit one row per
-       matching shape (global / per-facility / per-machine / both).
-    3) Reduce to one row per (study_id, modality_type) via 4-tier
+    2) For each study row, look up pc1.proceduresestimate by CPT-code
+       set-equality -- always, override or not, since this is the only
+       source of modality_type. No catalog match at all -> that study is
+       skipped with an ERROR; the rest of the run continues.
+    3) If the study also has a duration/required_slots override, replace
+       the catalog's required_slots with it and emit a single synthetic
+       global-tier row (applies uniformly to every candidate machine,
+       ignoring per-machine catalog variation). Otherwise emit one row per
+       matching catalog shape (global / per-facility / per-machine / both).
+    4) Reduce to one row per (study_id, modality_type) via 4-tier
        precedence, for summary_list only.
-    4) Aggregate required_slots per modality (summary_list, legacy shape).
+    5) Aggregate required_slots per modality (summary_list, legacy shape).
 
     Returns:
         summary_list: [{modality_type, total_slots}, ...] sorted by slots desc
@@ -152,9 +178,20 @@ def get_summary_list(supabase, study_rows, client_id, slot_size_minutes):
 
     for study in study_rows:
         study_id = study["study_id"]
-        modality_type = study["modality_type"]
         duration = study.get("duration")
         required_slots = study.get("required_slots")
+        codes = study.get("procedure_code") or []
+
+        matches = _fetch_catalog_matches(supabase, client_id, codes_cache, codes)
+
+        if not matches:
+            print(
+                f"  ERROR: study {study_id}: procedure_code {codes} has no "
+                f"matching pc1.proceduresestimate row (no catalog entry at "
+                f"all -- add one, even a bare global row, before this study "
+                f"can be scheduled); study excluded."
+            )
+            continue
 
         if required_slots is not None or duration is not None:
             slots = (
@@ -164,38 +201,19 @@ def get_summary_list(supabase, study_rows, client_id, slot_size_minutes):
             rows.append({
                 "study_id": study_id,
                 "facility_id": facility_id,
-                "modality_type": modality_type,
+                "modality_type": matches[0].get("modality_type"),
                 "modality_id": None,
                 "pe_facility_id": None,
                 "required_slots": slots,
-                "procedure_description": f"OVERRIDE({study.get('procedure_code')})",
+                "procedure_description": f"OVERRIDE({codes})",
             })
             continue
 
-        codes = study.get("procedure_code") or []
-        matches = _fetch_catalog_matches(supabase, client_id, codes_cache, codes)
-
-        if not matches:
-            print(
-                f"  Study {study_id} ({modality_type}): no proceduresestimate "
-                f"row matches procedure_code {codes}; study excluded."
-            )
-            continue
-
         for pe in matches:
-            pe_modality_type = pe.get("modality_type")
-            if pe_modality_type is not None and pe_modality_type != modality_type:
-                print(
-                    f"  WARNING: study {study_id} declares modality_type="
-                    f"{modality_type!r} but matched catalog row "
-                    f"(procedure_code={pe.get('procedure_code')}) has "
-                    f"modality_type={pe_modality_type!r}; using the study's "
-                    f"declared modality_type."
-                )
             rows.append({
                 "study_id": study_id,
                 "facility_id": facility_id,
-                "modality_type": modality_type,
+                "modality_type": pe.get("modality_type"),
                 "modality_id": pe.get("modality_id"),
                 "pe_facility_id": pe.get("facility_id"),
                 "required_slots": pe.get("required_slots"),

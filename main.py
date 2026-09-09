@@ -246,16 +246,17 @@ def _load_studies_payload(path):
     study_rows = payload.get("studies")
     if not study_rows:
         raise ValueError(f"{path}: no \"studies\" array found (or it's empty).")
-    required_keys = {"study_id", "patient_id", "facility_id", "modality_type"}
+    required_keys = {"study_id", "patient_id", "facility_id", "procedure_code"}
     for row in study_rows:
         missing = required_keys - row.keys()
         if missing:
             raise ValueError(f"{path}: study row {row!r} missing keys {missing}.")
-        if row.get("procedure_code") is None and row.get("duration") is None \
-                and row.get("required_slots") is None:
+        if not row.get("procedure_code"):
             raise ValueError(
-                f"{path}: study row {row!r} has neither procedure_code nor "
-                f"a duration/required_slots override."
+                f"{path}: study row {row!r} has an empty/missing "
+                f"procedure_code -- required on every row (modality_type is "
+                f"always derived from it via the catalog, never supplied "
+                f"directly; see get_studies.py)."
             )
     filters = payload.get("filters") or {}
     return study_rows, filters

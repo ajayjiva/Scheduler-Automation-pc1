@@ -1,8 +1,8 @@
 {
-  "_comment": "Reproduces the original 'python main.py --client-id=1 --patient-id=3' CLI test. Same procedures as migrations/0010 orders 900003+900004 (CT - ABDOMEN/PELVIS (74176) and XR - ABDOMEN/KUB/PELVIS COMBO (74018,72170), TEST-P03, Antioch). Per docs/session-handoff.md §8.9, expect a 45 min multi-modality chain (CT machine then the CR machine), no wait. modality_type for the combo row is confirmed 'CR' (not 'XR') from a live run against the dev DB on 2026-09-08 -- see the modality-mismatch warning this earlier produced.",
+  "_comment": "Reproduces the original 'python main.py --client-id=1 --patient-id=3' CLI test. Same procedures as migrations/0010 orders 900003+900004 (CT - ABDOMEN/PELVIS (74176) and XR - ABDOMEN/KUB/PELVIS COMBO (74018,72170), TEST-P03, Antioch). Per docs/session-handoff.md §8.9, expect a 45 min multi-modality chain (CT machine then the CR machine), no wait. modality_type is NOT an input field -- it's always derived from procedure_code via pc1.proceduresestimate (confirmed live: the combo procedure's real modality_type is 'CR', not the 'XR' its description text suggested -- exactly the kind of mismatch this design now makes impossible to get wrong from the input side).",
   "studies": [
-    {"study_id": 301, "patient_id": 3, "facility_id": 3, "procedure_code": ["74176"], "modality_type": "CT"},
-    {"study_id": 302, "patient_id": 3, "facility_id": 3, "procedure_code": ["74018", "72170"], "modality_type": "CR"}
+    {"study_id": 301, "patient_id": 3, "facility_id": 3, "procedure_code": ["74176"]},
+    {"study_id": 302, "patient_id": 3, "facility_id": 3, "procedure_code": ["74018", "72170"]}
   ],
   "filters": {
     "max_options": 5
